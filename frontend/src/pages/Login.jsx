@@ -67,14 +67,17 @@ export default function Login() {
             <form onSubmit={handleSubmit} className="space-y-4">
               {/* Username */}
               <div>
-                <label className="text-gray-700 text-sm font-medium mb-1.5 block">Username</label>
+                <label className="text-gray-700 text-sm font-medium mb-1.5 block">Linux Username</label>
                 <div className="relative">
                   <span className="material-symbols-outlined absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400 text-xl">person</span>
                   <input
                     type="text"
                     value={form.username}
                     onChange={e => setForm(p => ({ ...p, username: e.target.value }))}
-                    placeholder="Enter your username"
+                    placeholder="e.g. superadmin, root"
+                    autoComplete="username"
+                    spellCheck="false"
+                    autoCapitalize="off"
                     required
                     className="input pl-11"
                   />
@@ -84,10 +87,8 @@ export default function Login() {
               {/* Password */}
               <div>
                 <div className="flex items-center justify-between mb-1.5">
-                  <label className="text-gray-700 text-sm font-medium">Password</label>
-                  <button type="button" className="text-primary text-xs font-semibold hover:underline">
-                    Forgot Password?
-                  </button>
+                  <label className="text-gray-700 text-sm font-medium">Linux Password</label>
+                  <span className="text-gray-400 text-xs">Use `passwd` on server</span>
                 </div>
                 <div className="relative">
                   <span className="material-symbols-outlined absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400 text-xl">key</span>
@@ -95,7 +96,8 @@ export default function Login() {
                     type={showPw ? 'text' : 'password'}
                     value={form.password}
                     onChange={e => setForm(p => ({ ...p, password: e.target.value }))}
-                    placeholder="Enter your password"
+                    placeholder="Your OS account password"
+                    autoComplete="current-password"
                     required
                     className="input pl-11 pr-11"
                   />
@@ -129,12 +131,13 @@ export default function Login() {
 
             {/* Footer */}
             <div className="flex items-center justify-center gap-2 mt-8 text-gray-400 text-xs font-medium uppercase tracking-wide">
-              <span className="material-symbols-outlined text-sm">lock</span>
-              Protected by End-to-End Encryption
+              <span className="material-symbols-outlined text-sm">verified_user</span>
+              Authenticated via Linux PAM
             </div>
 
-            <p className="text-center text-gray-300 text-xs mt-3">
-              Demo: <span className="text-gray-400">admin / Admin@123</span>
+            <p className="text-center text-gray-300 text-[11px] mt-3 leading-relaxed">
+              Sign in with your real OS account.<br/>
+              <span className="text-gray-400">sudo / wheel members → admin role</span>
             </p>
           </div>
         </div>

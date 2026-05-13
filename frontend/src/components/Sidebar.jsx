@@ -10,8 +10,8 @@ const navItems = [
 ]
 
 const bottomItems = [
-  { icon: 'settings', label: 'Settings' },
-  { icon: 'help_outline', label: 'Support' },
+  { to: '/settings', icon: 'settings',     label: 'Settings' },
+  { to: '/support',  icon: 'help_outline', label: 'Support' },
 ]
 
 export default function Sidebar() {
@@ -19,7 +19,6 @@ export default function Sidebar() {
 
   return (
     <aside className="fixed left-0 top-0 h-screen w-60 bg-white shadow-sidebar border-r border-gray-100 flex flex-col z-30">
-      {/* Brand */}
       <div className="px-5 pt-6 pb-5 border-b border-gray-100">
         <div className="flex items-center gap-3">
           <div className="w-9 h-9 bg-primary rounded-xl flex items-center justify-center shadow-sm shrink-0">
@@ -32,7 +31,6 @@ export default function Sidebar() {
         </div>
       </div>
 
-      {/* Nav */}
       <nav className="flex-1 px-3 py-4 space-y-0.5 overflow-y-auto">
         {navItems.map(({ to, icon, label }) => (
           <NavLink
@@ -61,19 +59,24 @@ export default function Sidebar() {
         ))}
       </nav>
 
-      {/* Bottom */}
       <div className="px-3 pb-4 border-t border-gray-100 pt-3 space-y-0.5">
-        {bottomItems.map(({ icon, label }) => (
-          <button
-            key={label}
-            className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-gray-500 hover:text-gray-800 hover:bg-gray-50 transition-all duration-150"
+        {bottomItems.map(({ to, icon, label }) => (
+          <NavLink
+            key={to}
+            to={to}
+            className={({ isActive }) =>
+              `w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-150 ${
+                isActive
+                  ? 'bg-primary text-white shadow-sm'
+                  : 'text-gray-500 hover:text-gray-800 hover:bg-gray-50'
+              }`
+            }
           >
             <span className="material-symbols-outlined text-xl">{icon}</span>
             {label}
-          </button>
+          </NavLink>
         ))}
 
-        {/* User row */}
         <div className="flex items-center gap-3 px-3 py-2.5 mt-1 rounded-xl hover:bg-gray-50 transition-colors cursor-default">
           <div className="avatar bg-primary text-xs shrink-0">
             {user?.username?.slice(0, 2).toUpperCase()}
