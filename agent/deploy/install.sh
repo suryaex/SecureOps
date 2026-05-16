@@ -5,7 +5,11 @@
 #           Debian 11 / 12 / 13
 #           Linux Mint, Pop!_OS, Elementary, Kali, Raspbian
 #
-# Usage:
+# Usage (RECOMMENDED — agent generates its own key):
+#   sudo bash install.sh
+#   → outputs API key at the end. Paste it into Controller UI.
+#
+# Usage (legacy — pre-generated key from controller):
 #   sudo SECUREOPS_AGENT_KEY=<key> bash install.sh
 #
 # Optional env vars:
@@ -16,6 +20,7 @@
 #   SECUREOPS_RECORD_SESSIONS = 1
 #   SECUREOPS_RECORD_DIR      = /var/log/secureops/sessions
 #   REPO_URL / INSTALL_DIR
+#   KEY_FILE                  = /etc/secureops-agent/key  (where key persists)
 
 set -euo pipefail
 
@@ -23,6 +28,7 @@ REPO_URL="${REPO_URL:-https://github.com/suryaex/secureops.git}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/secureops-agent}"
 PORT="${SECUREOPS_AGENT_PORT:-8001}"
 KEY="${SECUREOPS_AGENT_KEY:-}"
+KEY_FILE="${KEY_FILE:-/etc/secureops-agent/key}"
 SKIP_TS="${SKIP_TAILSCALE:-0}"
 
 SHELL_USER="${SECUREOPS_SHELL_USER:-}"
@@ -37,7 +43,27 @@ warn() { echo -e "${YELLOW}!! $*${NC}"; }
 die()  { echo -e "${RED}ERROR: $*${NC}"; exit 1; }
 
 [[ $EUID -ne 0 ]] && die "Run with sudo / as root."
-[[ -z "$KEY"  ]] && die "Missing SECUREOPS_AGENT_KEY. Get it from the Controller UI → Servers → Add Server."
+
+# -------- API key: reuse existing → env override → generate new --------
+GENERATED_KEY=0
+if [[ -z "$KEY" ]]; then
+  if [[ -f "$KEY_FILE" ]]; then
+    KEY="$(cat "$KEY_FILE")"
+    info "Reusing existing key at $KEY_FILE"
+  else
+    # Generate a 43-char URL-safe key (32 bytes base64-url, no padding)
+    if command -v openssl >/dev/null 2>&1; then
+      KEY="$(openssl rand -base64 32 | tr -d '/+=' | cut -c1-43)"
+    else
+      KEY="$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | cut -c1-43)"
+    fi
+    GENERATED_KEY=1
+    say "Generated new API key for this agent"
+  fi
+fi
+mkdir -p "$(dirname "$KEY_FILE")"
+echo -n "$KEY" > "$KEY_FILE"
+chmod 0600 "$KEY_FILE"
 
 # -------- Detect distro ----------
 if [[ -f /etc/os-release ]]; then
@@ -170,18 +196,31 @@ TS_IP="${TS_IP:-}"
 USE_IP="${TS_IP:-$LAN_IP}"
 
 echo
-echo -e "${GREEN}=====================================================${NC}"
-echo -e "${GREEN}  ✅ SecureOps Agent installed!${NC}"
+echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║       ✅ SecureOps Agent Installed Successfully              ║${NC}"
+echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo
-echo "  Distro:       $PRETTY"
-echo "  Hostname:     $(hostname)"
-echo "  IP for ctrl:  $USE_IP"
-echo "  Port:         $PORT"
-[[ -n "$SHELL_USER" ]] && echo "  Shell user:   $SHELL_USER (drop-privileges enabled)"
-[[ "$RECORD" == "1" ]] && echo "  Recording:    ON  ($RECORD_DIR_VAR)"
+echo -e "  Distro:       $PRETTY"
+echo -e "  Hostname:     $(hostname)"
+[[ -n "$SHELL_USER" ]] && echo -e "  Shell user:   ${BLUE}$SHELL_USER${NC} (drop-privileges enabled)"
+[[ "$RECORD" == "1" ]] && echo -e "  Recording:    ${BLUE}ON${NC}  ($RECORD_DIR_VAR)"
 echo
-echo "  In the Controller UI → Servers, edit this entry:"
-echo "    API URL:  http://$USE_IP:$PORT"
+echo -e "${YELLOW}┌──────────────────────────────────────────────────────────────┐${NC}"
+echo -e "${YELLOW}│       📋 PASTE THESE TO THE CONTROLLER UI                    │${NC}"
+echo -e "${YELLOW}│       (Sidebar → Servers → Add Server)                       │${NC}"
+echo -e "${YELLOW}└──────────────────────────────────────────────────────────────┘${NC}"
 echo
-echo "  Logs:  sudo journalctl -u secureops-agent -f"
-echo -e "${GREEN}=====================================================${NC}"
+echo -e "  ${BLUE}Name${NC}     :  $(hostname)"
+echo -e "  ${BLUE}API URL${NC}  :  ${GREEN}http://$USE_IP:$PORT${NC}"
+echo -e "  ${BLUE}API Key${NC}  :  ${GREEN}$KEY${NC}"
+echo
+if [[ "$GENERATED_KEY" == "1" ]]; then
+  echo -e "  ${YELLOW}⚠  This key was auto-generated. Copy it now —${NC}"
+  echo -e "  ${YELLOW}    you can also find it later at:  $KEY_FILE${NC}"
+else
+  echo -e "  Key reused/provided (see $KEY_FILE)"
+fi
+echo
+echo -e "  Logs:  ${BLUE}sudo journalctl -u secureops-agent -f${NC}"
+echo
+echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"

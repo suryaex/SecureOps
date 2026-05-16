@@ -191,22 +191,9 @@ Output terakhir kira-kira:
 
 ## Langkah 1.4 — Daftarkan agent pertama (`web-prod`)
 
-**Di browser** (controller UI):
+> 🆕 **Flow baru (v1.5+):** Agent generate API key sendiri saat install. Kamu **tinggal copy-paste** ke Controller UI — tidak perlu bolak-balik antara browser dan terminal.
 
-1. Klik sidebar **Servers** (admin only — pastikan akun kamu ada di group sudo)
-2. Klik tombol **Add Server**
-3. Isi:
-   - **Name**: `web-prod`
-   - **Hostname**: `web-prod`
-   - **API URL**: kosongkan dulu (nanti diisi setelah agent terinstall)
-   - **Tags**: `production, web`
-4. Klik **Register Server**
-5. **Pop-up muncul** dengan **API Key** — **COPY API KEY-NYA**, contoh:
-   ```
-   Xy7Bz_AbC123dEf456GhIjK_lMnOpQrStUv
-   ```
-
-**Di VM `web-prod`:**
+### Step 1.4.1 — Install agent di VM `web-prod` DULU
 
 ```bash
 # SSH ke web-prod
@@ -215,32 +202,65 @@ ssh superadmin@192.168.1.101
 # Buat user terbatas untuk shell session (best practice — biar gak run as root)
 sudo useradd -m -s /bin/bash secureops
 
-# Install agent dengan opsi production-grade
-sudo SECUREOPS_AGENT_KEY=Xy7Bz_AbC123dEf456GhIjK_lMnOpQrStUv \
-     SECUREOPS_SHELL_USER=secureops \
+# Install agent — TANPA API key, biar di-generate otomatis
+sudo SECUREOPS_SHELL_USER=secureops \
      SECUREOPS_RECORD_SESSIONS=1 \
      bash <(curl -fsSL https://raw.githubusercontent.com/suryaex/secureops/main/agent/deploy/install.sh)
 ```
 
-> Ganti `Xy7Bz_...` dengan API Key kamu yang dari pop-up tadi.
-
-Output terakhir:
+Tunggu beberapa menit. **Output terakhir** akan tampil seperti ini:
 
 ```
-✅ SecureOps Agent installed!
+╔══════════════════════════════════════════════════════════════╗
+║       ✅ SecureOps Agent Installed Successfully              ║
+╚══════════════════════════════════════════════════════════════╝
+
+  Distro:       Ubuntu 24.04.1 LTS
   Hostname:     web-prod
-  IP for ctrl:  100.64.10.12     ← Tailscale IP
-  Port:         8001
+  Shell user:   secureops (drop-privileges enabled)
+  Recording:    ON  (/var/log/secureops/sessions)
+
+┌──────────────────────────────────────────────────────────────┐
+│       📋 PASTE THESE TO THE CONTROLLER UI                    │
+│       (Sidebar → Servers → Add Server)                       │
+└──────────────────────────────────────────────────────────────┘
+
+  Name     :  web-prod
+  API URL  :  http://100.64.10.12:8001
+  API Key  :  v8K3mNpQ7xT2wY9zR4sH6jL5dF1cB0aXuG8eI3yV2nM
+
+  ⚠  This key was auto-generated. Copy it now —
+     you can also find it later at:  /etc/secureops-agent/key
 ```
 
-**Catat Tailscale IP-nya** (`100.64.10.12`), lalu **kembali ke browser**:
+**Copy 3 informasi ini**:
+- `Name` (web-prod)
+- `API URL` (http://100.64.10.12:8001)
+- `API Key` (v8K3mNpQ...)
 
-1. Sidebar **Servers** → klik icon ✏️ pensil di row `web-prod`
-2. **API URL**: `http://100.64.10.12:8001`
-3. Save
-4. Klik icon 📡 ping → harus muncul 🟢 **online**
+> 💡 Lupa copy API Key? Ambil ulang: `sudo cat /etc/secureops-agent/key`
 
-✅ Server pertama tersambung.
+### Step 1.4.2 — Daftarkan di Controller UI
+
+**Di browser** (controller UI):
+
+1. Sidebar **Servers** → tombol **+ Add Server**
+2. Modal terbuka dengan instruksi instalasi di atas (skip karena sudah di-install)
+3. Paste informasi yang sudah di-copy:
+
+   | Field | Value |
+   |---|---|
+   | **Server name** | `web-prod` |
+   | **Hostname** | `web-prod` (auto-fill) |
+   | **API URL** | `http://100.64.10.12:8001` |
+   | **API Key** | `v8K3mNpQ7xT2wY9zR4sH6jL5dF1cB0aXuG8eI3yV2nM` |
+   | **Tags** | `production, web` |
+
+   > 📌 Bisa klik icon 📋 di field API Key untuk auto-paste dari clipboard.
+
+4. Klik **Register & Connect** → otomatis ping → 🟢 **online**
+
+✅ Server pertama tersambung — total ~3 menit.
 
 ---
 
@@ -550,11 +570,9 @@ sudo systemctl restart secureops-backend
 
 ## Langkah 2.5 — Install agent di setiap server produksi
 
-Untuk setiap server fisik / VPS yang mau dimonitor, ulangi pola yang sama seperti **Langkah 1.4** tapi dengan server asli:
+Flow agent registration **agent-first** (key di-generate di sisi agent):
 
-**1. Di browser**: Login ke `https://secureops.site` sebagai admin → Servers → Add Server → copy API key
-
-**2. Di server target**:
+**1. Di server target** — install lebih dulu:
 
 ```bash
 # Install Tailscale (kalau server di lokasi berbeda dari controller)
@@ -564,19 +582,24 @@ sudo tailscale up
 # Buat user shell terbatas
 sudo useradd -m -s /bin/bash secureops
 
-# Install agent dengan production options
-sudo SECUREOPS_AGENT_KEY=<key-dari-UI> \
-     SECUREOPS_SHELL_USER=secureops \
+# Install agent — TANPA API key, akan di-generate otomatis
+sudo SECUREOPS_SHELL_USER=secureops \
      SECUREOPS_RECORD_SESSIONS=1 \
      bash <(curl -fsSL https://raw.githubusercontent.com/suryaex/secureops/main/agent/deploy/install.sh)
-
-# Catat Tailscale IP yang muncul di output terakhir
 ```
 
-**3. Kembali ke browser**:
+Di output terakhir, copy **3 informasi**:
+- `Name` (default = hostname server)
+- `API URL` (otomatis pakai Tailscale IP kalau ada, atau LAN IP)
+- `API Key` (auto-generated 43 karakter)
 
-- Servers → edit row yang baru → isi API URL: `http://<tailscale-ip>:8001` → Save
-- Klik ping → 🟢
+**2. Di browser** — buka `https://secureops.site` sebagai admin:
+
+- Sidebar **Servers** → **+ Add Server**
+- Paste 3 informasi dari step 1 + tambah tags
+- Klik **Register & Connect** → otomatis ping → 🟢
+
+> 📌 Untuk batch install banyak server, jalankan installer di semua server dulu (paralel via SSH), lalu daftarkan satu-satu di UI. Setiap agent punya key unik sendiri.
 
 ---
 
@@ -716,18 +739,26 @@ Cek DNS-nya:
 
 ## Mau monitoring 10+ server sekaligus?
 
-Pakai loop installer di laptop kamu:
+Setiap server sekarang **generate API key-nya sendiri**, jadi tinggal jalankan installer paralel:
 
 ```bash
-KEY="<paste-shared-API-key-disini>"
-for ip in 100.64.10.5 100.64.10.12 100.64.10.18; do
-  ssh root@$ip "SECUREOPS_AGENT_KEY=$KEY \
-                SECUREOPS_SHELL_USER=secureops \
-                bash <(curl -fsSL https://raw.githubusercontent.com/suryaex/secureops/main/agent/deploy/install.sh)"
+# Install ke banyak server sekaligus (paralel)
+for ip in 100.64.10.5 100.64.10.12 100.64.10.18 100.64.10.24; do
+  ssh root@$ip "SECUREOPS_SHELL_USER=secureops \
+                SECUREOPS_RECORD_SESSIONS=1 \
+                bash <(curl -fsSL https://raw.githubusercontent.com/suryaex/secureops/main/agent/deploy/install.sh)" \
+   2>&1 | tee install-$ip.log &
+done
+wait
+
+# Lalu ambil API key + URL dari log masing-masing:
+for ip in 100.64.10.5 100.64.10.12 100.64.10.18 100.64.10.24; do
+  echo "=== $ip ==="
+  grep -E "(API URL|API Key)" install-$ip.log
 done
 ```
 
-> ⚠️ Setiap server tetap perlu API key **unik** sebenarnya — generate satu per satu dari UI agar bisa di-rotate/revoke per-server.
+Outputnya tinggal copy-paste ke Controller UI satu per satu. **Tiap server punya key unik** dan bisa di-rotate/revoke independen.
 
 ## Mau push notif alert ke Telegram/Slack?
 

@@ -18,7 +18,6 @@ export default function Servers() {
   const [loading, setLoading] = useState(true)
   const [showAdd, setShowAdd] = useState(false)
   const [pingingId, setPingingId] = useState(null)
-  const [keyReveal, setKeyReveal] = useState(null)
   const isAdmin = user?.role === 'admin'
 
   const load = () =>
@@ -160,12 +159,15 @@ export default function Servers() {
       {showAdd && (
         <AddServerModal
           onClose={() => setShowAdd(false)}
-          onSaved={(reveal) => { setShowAdd(false); setKeyReveal(reveal); load(); refresh && refresh() }}
+          onSaved={async (data) => {
+            setShowAdd(false)
+            await load()
+            // Auto-ping the new server to verify connectivity
+            try { await api.post(`/servers/${data.id}/ping`) } catch {}
+            await load()
+            refresh && refresh()
+          }}
         />
-      )}
-
-      {keyReveal && (
-        <KeyRevealModal data={keyReveal} onClose={() => setKeyReveal(null)} />
       )}
     </div>
   )
@@ -189,6 +191,7 @@ function AddServerModal({ onClose, onSaved }) {
   const [form, setForm] = useState({ name: '', hostname: '', api_url: '', tags: '', api_key: '' })
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
+  const [showKey, setShowKey] = useState(false)
 
   const submit = async (e) => {
     e.preventDefault(); setErr(''); setBusy(true)
@@ -206,7 +209,7 @@ function AddServerModal({ onClose, onSaved }) {
 
   return (
     <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg overflow-hidden">
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-xl overflow-hidden">
         <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
           <h3 className="text-gray-800 font-semibold flex items-center gap-2">
             <span className="material-symbols-outlined text-primary">add_to_queue</span>
@@ -216,32 +219,99 @@ function AddServerModal({ onClose, onSaved }) {
             <span className="material-symbols-outlined">close</span>
           </button>
         </div>
+
+        {/* Instructions panel */}
+        <div className="px-5 py-3 bg-blue-50 border-b border-blue-100">
+          <p className="text-xs text-blue-900 font-semibold mb-1.5 flex items-center gap-1.5">
+            <span className="material-symbols-outlined text-base">terminal</span>
+            Install the agent first, then paste below
+          </p>
+          <pre className="bg-blue-900 text-green-300 text-[11px] font-mono p-2.5 rounded-md overflow-x-auto leading-relaxed">
+{`sudo bash <(curl -fsSL https://raw.githubusercontent.com/suryaex/secureops/main/agent/deploy/install.sh)`}
+          </pre>
+          <p className="text-[11px] text-blue-700 mt-1.5 leading-snug">
+            The installer auto-generates an API key on the agent server. Copy <b>API URL</b> & <b>API Key</b> from its final output, then paste them into the form below.
+          </p>
+        </div>
+
         <form onSubmit={submit} className="p-5 space-y-4">
           {err && <p className="text-danger text-sm px-3 py-2 bg-danger-light border border-danger-border rounded-lg">{err}</p>}
 
-          <FormField label="Server name" required>
-            <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="e.g. web-prod-01" required className="input" />
+          <div className="grid grid-cols-2 gap-3">
+            <FormField label="Server name" required>
+              <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="web-prod-01" required className="input" />
+            </FormField>
+
+            <FormField label="Hostname (display)">
+              <input value={form.hostname} onChange={e => setForm(f => ({ ...f, hostname: e.target.value }))} placeholder="(defaults to name)" className="input" />
+            </FormField>
+          </div>
+
+          <FormField label="API URL — from agent installer output" required>
+            <input
+              value={form.api_url}
+              onChange={e => setForm(f => ({ ...f, api_url: e.target.value }))}
+              placeholder="http://100.64.10.12:8001"
+              required
+              className="input font-mono text-xs"
+              spellCheck="false"
+              autoComplete="off"
+            />
           </FormField>
 
-          <FormField label="Hostname (display)" >
-            <input value={form.hostname} onChange={e => setForm(f => ({ ...f, hostname: e.target.value }))} placeholder="defaults to name" className="input" />
+          <FormField label="API Key — from agent installer output" required>
+            <div className="relative">
+              <input
+                type={showKey ? 'text' : 'password'}
+                value={form.api_key}
+                onChange={e => setForm(f => ({ ...f, api_key: e.target.value }))}
+                placeholder="paste 43-char token from agent..."
+                required
+                minLength={20}
+                className="input font-mono text-xs pr-20"
+                spellCheck="false"
+                autoComplete="off"
+              />
+              <div className="absolute right-2 top-1/2 -translate-y-1/2 flex gap-1">
+                <button
+                  type="button"
+                  onClick={() => setShowKey(s => !s)}
+                  className="text-gray-400 hover:text-gray-700 p-1"
+                  title={showKey ? 'Hide' : 'Show'}
+                >
+                  <span className="material-symbols-outlined text-base">{showKey ? 'visibility_off' : 'visibility'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const text = await navigator.clipboard.readText()
+                      if (text) setForm(f => ({ ...f, api_key: text.trim() }))
+                    } catch {}
+                  }}
+                  className="text-gray-400 hover:text-primary p-1"
+                  title="Paste from clipboard"
+                >
+                  <span className="material-symbols-outlined text-base">content_paste</span>
+                </button>
+              </div>
+            </div>
+            <p className="text-[11px] text-gray-400 mt-1">
+              Tip: in agent's terminal run <code className="bg-gray-100 px-1 rounded font-mono">sudo cat /etc/secureops-agent/key</code> if you forgot to copy.
+            </p>
           </FormField>
 
-          <FormField label="Agent API URL" required>
-            <input value={form.api_url} onChange={e => setForm(f => ({ ...f, api_url: e.target.value }))} placeholder="http://100.x.x.x:8001 (Tailscale IP)" required className="input font-mono text-xs" />
-          </FormField>
-
-          <FormField label="API key (leave empty to auto-generate)">
-            <input value={form.api_key} onChange={e => setForm(f => ({ ...f, api_key: e.target.value }))} placeholder="auto-generated 32-char token" className="input font-mono text-xs" />
-          </FormField>
-
-          <FormField label="Tags (comma-separated)">
+          <FormField label="Tags (optional, comma-separated)">
             <input value={form.tags} onChange={e => setForm(f => ({ ...f, tags: e.target.value }))} placeholder="production, web, db" className="input" />
           </FormField>
 
           <div className="flex gap-2 pt-2">
             <button type="submit" disabled={busy} className="btn-primary flex-1 justify-center">
-              {busy ? 'Registering…' : 'Register Server'}
+              {busy ? (
+                <><span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />Registering…</>
+              ) : (
+                <><span className="material-symbols-outlined text-lg">add</span>Register & Connect</>
+              )}
             </button>
             <button type="button" onClick={onClose} className="btn-secondary">Cancel</button>
           </div>
@@ -262,47 +332,4 @@ function FormField({ label, required, children }) {
   )
 }
 
-function KeyRevealModal({ data, onClose }) {
-  const [copied, setCopied] = useState(false)
-  const copy = (txt) => {
-    navigator.clipboard.writeText(txt)
-    setCopied(true); setTimeout(() => setCopied(false), 2000)
-  }
-  return (
-    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl shadow-xl w-full max-w-xl">
-        <div className="px-5 py-4 border-b border-gray-100">
-          <h3 className="text-gray-800 font-semibold flex items-center gap-2">
-            <span className="material-symbols-outlined text-success">key</span>
-            Server registered — copy the agent setup snippet
-          </h3>
-        </div>
-        <div className="p-5 space-y-4">
-          <p className="text-sm text-gray-600">
-            Paste this on the new server (<code className="font-mono bg-gray-100 px-1.5 rounded">{data.hostname}</code>). The shared key only appears <b>once</b>.
-          </p>
-          <pre className="bg-gray-900 text-green-300 p-4 rounded-xl text-xs overflow-x-auto leading-relaxed whitespace-pre-wrap break-all">
-{`# On the agent server:
-export SECUREOPS_AGENT_MODE=1
-export SECUREOPS_AGENT_KEY=${data.api_key}
-export SECUREOPS_BIND=0.0.0.0:8001
-
-# Or paste into /etc/systemd/system/secureops-agent.service:
-Environment="SECUREOPS_AGENT_MODE=1"
-Environment="SECUREOPS_AGENT_KEY=${data.api_key}"
-Environment="SECUREOPS_BIND=0.0.0.0:8001"
-
-# Controller will reach it at:  ${data.api_url}`}
-          </pre>
-          <div className="flex gap-2">
-            <button onClick={() => copy(data.api_key)} className="btn-secondary flex-1 justify-center">
-              <span className="material-symbols-outlined text-base">content_copy</span>
-              {copied ? 'Copied!' : 'Copy API Key'}
-            </button>
-            <button onClick={onClose} className="btn-primary flex-1 justify-center">I've saved it</button>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
+// (KeyRevealModal removed — agent now generates its own key during install)
