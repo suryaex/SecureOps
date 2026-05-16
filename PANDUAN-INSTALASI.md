@@ -4,6 +4,34 @@ Panduan lengkap deployment SecureOps untuk **State Polytechnic of Sriwijaya** de
 
 ---
 
+## ✅ Distro yang Didukung
+
+Installer otomatis mendeteksi distro dan menyesuaikan langkah-langkahnya. Versi yang **sudah ditest**:
+
+| Distro                | Versi Didukung           | Python default | Catatan |
+|-----------------------|--------------------------|----------------|---------|
+| **Ubuntu Server**     | 20.04 / 22.04 / **24.04** / 25.04 | 3.8 → 3.12 | Direkomendasikan: 22.04 LTS atau 24.04 LTS |
+| **Debian**            | 11 (Bullseye) / 12 (Bookworm) / 13 (Trixie) | 3.9 → 3.13 | Stable, ringan |
+| **Linux Mint**        | 20+ / 21+ / 22+          | mengikuti Ubuntu | ✅ Tested |
+| **Pop!_OS**           | 22.04+                   | mengikuti Ubuntu | ✅ Tested |
+| **Elementary OS**     | 7+                       | mengikuti Ubuntu | ✅ |
+| **Kali Linux**        | 2024.x+                  | 3.11+ | ⚠️ Untuk audit lab only |
+| **Raspberry Pi OS**   | Bookworm (arm64)          | 3.11+ | ✅ Untuk monitoring perangkat IoT |
+
+**Yang TIDAK didukung** (perlu manual install): Fedora, RHEL/CentOS, openSUSE, Arch (karena pakai package manager yang berbeda — bisa di-port nanti kalau perlu).
+
+### Apa yang sudah di-fix untuk Ubuntu 24.04+
+
+| Issue | Solusi |
+|---|---|
+| **PEP 668** (`externally-managed-environment` error) | Installer pakai `venv` terpisah — tidak install ke system Python |
+| **`bcrypt` 4.1+ warning di passlib** | Auto-suppress di `auth.py` (functional, hanya log noise) |
+| **`certbot` apt-package hilang di Ubuntu 24+** | Installer auto-deteksi & instruksikan `snap install certbot` di Ubuntu 24+ |
+| **Node.js 18 sudah deprecated** | Installer pakai Node 20 LTS via NodeSource |
+| **Version pin terlalu strict** | Semua dependency pakai range (`>=X,<Y`) supaya kompatibel di semua versi Python 3.10–3.13 |
+
+---
+
 ## 📋 Rencana Deployment
 
 ```
@@ -643,6 +671,9 @@ Sidebar **Users** → klik icon 🔑 → masukkan password baru → Save.
 | Gejala | Solusi |
 |---|---|
 | `502 Bad Gateway` di browser | `sudo systemctl restart secureops-backend nginx` |
+| `error: externally-managed-environment` saat pip | Installer udah pakai venv — pastikan jalanin `bash controller/deploy/deploy-prod.sh` bukan pip manual |
+| Ubuntu 24.04: `certbot` tidak ada di apt | Pakai snap: `sudo snap install --classic certbot && sudo ln -sf /snap/bin/certbot /usr/bin/certbot` |
+| Warning "trapped: error reading bcrypt version" | Sudah ditekan otomatis di v1.4+. Update repo: `git pull && bash controller/deploy/deploy-prod.sh` |
 | Login gagal: "Invalid Linux username or password" | Pastikan user-nya ada di controller server (`getent passwd <user>`). Backend harus run as root (cek `systemctl status` "User=root") |
 | Agent merah / offline | Cek `tailscale status` di kedua side. Test: `curl -H "X-Agent-Key: <key>" http://<tailscale-ip>:8001/api/health` |
 | Terminal disconnect setelah 100 detik (Cloudflare) | Free plan limit. Solusi: keep typing OR upgrade ke Pro OR pakai Let's Encrypt langsung |

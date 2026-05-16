@@ -11,10 +11,19 @@ After a successful PAM login, the Linux user is auto-provisioned into the
 """
 from datetime import datetime, timedelta
 from typing import Optional
+import logging
 import os
 import platform
+import warnings
 import grp
 import pwd
+
+# ---- Suppress noisy passlib + bcrypt 4.x warning on Ubuntu 24+ ----
+# passlib 1.7.4 tries to read bcrypt.__about__.__version__ which was
+# removed in bcrypt 4.1+. Functionality is unaffected, only the log is
+# noisy on each import. This MUST run before `passlib.context` is loaded.
+logging.getLogger("passlib").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*bcrypt.*", category=UserWarning)
 
 from jose import JWTError, jwt
 from passlib.context import CryptContext

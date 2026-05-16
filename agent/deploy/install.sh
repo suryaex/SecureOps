@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
+# SecureOps AGENT installer
 #
-# SecureOps AGENT installer.
-# Run on every server you want to monitor.
+# Supports: Ubuntu 20.04 / 22.04 / 24.04 / 25.04
+#           Debian 11 / 12 / 13
+#           Linux Mint, Pop!_OS, Elementary, Kali, Raspbian
 #
 # Usage:
-#   sudo SECUREOPS_AGENT_KEY=<paste-key-from-controller-UI> bash install.sh
+#   sudo SECUREOPS_AGENT_KEY=<key> bash install.sh
 #
-# Optional env:
-#   SECUREOPS_AGENT_PORT=8001  (default)
-#   SKIP_TAILSCALE=1           (if you're on same LAN as controller)
-#   REPO_URL=https://github.com/suryaex/secureops.git
-#   INSTALL_DIR=/opt/secureops-agent
+# Optional env vars:
+#   SECUREOPS_AGENT_PORT      = 8001
+#   SKIP_TAILSCALE            = 1   (skip on LAN-only setups)
+#   SECUREOPS_SHELL_USER      = secureops   (drop-privileges shell)
+#   SECUREOPS_SHELL_CMD       = /usr/bin/zsh -l
+#   SECUREOPS_RECORD_SESSIONS = 1
+#   SECUREOPS_RECORD_DIR      = /var/log/secureops/sessions
+#   REPO_URL / INSTALL_DIR
 
 set -euo pipefail
 
@@ -20,59 +25,92 @@ PORT="${SECUREOPS_AGENT_PORT:-8001}"
 KEY="${SECUREOPS_AGENT_KEY:-}"
 SKIP_TS="${SKIP_TAILSCALE:-0}"
 
-# Terminal options
-SHELL_USER="${SECUREOPS_SHELL_USER:-}"          # e.g. "secureops" — agent will `su -l` to this user (recommended)
-SHELL_CMD="${SECUREOPS_SHELL_CMD:-}"            # full custom command (overrides SHELL_USER)
-RECORD="${SECUREOPS_RECORD_SESSIONS:-0}"        # "1" to record every terminal session to .cast files
+SHELL_USER="${SECUREOPS_SHELL_USER:-}"
+SHELL_CMD="${SECUREOPS_SHELL_CMD:-}"
+RECORD="${SECUREOPS_RECORD_SESSIONS:-0}"
 RECORD_DIR_VAR="${SECUREOPS_RECORD_DIR:-/var/log/secureops/sessions}"
 
-GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[0;34m'; NC='\033[0m'
 say()  { echo -e "${GREEN}==> $*${NC}"; }
+info() { echo -e "${BLUE}ℹ  $*${NC}"; }
+warn() { echo -e "${YELLOW}!! $*${NC}"; }
 die()  { echo -e "${RED}ERROR: $*${NC}"; exit 1; }
 
 [[ $EUID -ne 0 ]] && die "Run with sudo / as root."
 [[ -z "$KEY"  ]] && die "Missing SECUREOPS_AGENT_KEY. Get it from the Controller UI → Servers → Add Server."
 
-say "Installing system packages..."
+# -------- Detect distro ----------
+if [[ -f /etc/os-release ]]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  DISTRO_ID="${ID,,}"
+  DISTRO_LIKE="${ID_LIKE:-}"
+  DISTRO_MAJOR="${VERSION_ID%%.*}"
+  PRETTY="${PRETTY_NAME:-$DISTRO_ID}"
+else
+  die "Cannot detect distro."
+fi
+
+case "$DISTRO_ID" in
+  ubuntu|debian|linuxmint|pop|elementary|kali|raspbian|neon) : ;;
+  *)
+    if [[ "$DISTRO_LIKE" == *debian* || "$DISTRO_LIKE" == *ubuntu* ]]; then :
+    else die "Unsupported distro: $DISTRO_ID"
+    fi
+    ;;
+esac
+
+say "Detected: $PRETTY"
+export DEBIAN_FRONTEND=noninteractive
+
+# -------- 1) System packages ----------
+say "Installing system packages…"
 apt-get update -y
 apt-get install -y --no-install-recommends \
     python3 python3-venv python3-pip python3-dev \
     git curl ca-certificates build-essential
 
+# -------- 2) Tailscale ----------
 if [[ "$SKIP_TS" != "1" ]]; then
   if ! command -v tailscale >/dev/null 2>&1; then
-    say "Installing Tailscale..."
+    say "Installing Tailscale…"
     curl -fsSL https://tailscale.com/install.sh | sh
   fi
   if ! tailscale status >/dev/null 2>&1; then
     echo
+    warn "Tailscale not authenticated yet."
     echo "Run on this server NOW:    sudo tailscale up"
     echo "Then re-run this installer."
     exit 1
   fi
   TS_IP=$(tailscale ip -4 | head -n1 || echo "")
-  say "Tailscale IP: $TS_IP"
+  info "Tailscale IP: $TS_IP"
 fi
 
+# -------- 3) Repository ----------
 if [[ -d "$INSTALL_DIR/.git" ]]; then
-  say "Updating existing install at $INSTALL_DIR..."
+  say "Updating existing install at $INSTALL_DIR…"
   git -C "$INSTALL_DIR" pull --ff-only
 else
-  say "Cloning repo to $INSTALL_DIR..."
+  say "Cloning repo to $INSTALL_DIR…"
   rm -rf "$INSTALL_DIR"
   git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
 fi
 
-say "Setting up Python venv..."
+# -------- 4) Python venv ----------
+say "Setting up Python venv…"
 cd "$INSTALL_DIR/agent/backend"
 [[ -d venv ]] || python3 -m venv venv
 # shellcheck disable=SC1091
 source venv/bin/activate
-pip install --quiet --upgrade pip
+pip install --quiet --upgrade pip setuptools wheel
 pip install --quiet -r requirements.txt
 deactivate
 
-say "Writing systemd unit..."
+info "Python: $(python3 --version)"
+
+# -------- 5) systemd unit ----------
+say "Writing systemd unit…"
 cat > /etc/systemd/system/secureops-agent.service <<EOF
 [Unit]
 Description=SecureOps Agent
@@ -107,6 +145,7 @@ SyslogIdentifier=secureops-agent
 WantedBy=multi-user.target
 EOF
 
+# Firewall
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
   ufw allow from 100.64.0.0/10 to any port "$PORT" comment 'SecureOps Agent (Tailscale)' || true
 fi
@@ -115,7 +154,7 @@ fi
 if [[ "$RECORD" == "1" ]]; then
   mkdir -p "$RECORD_DIR_VAR"
   chmod 0750 "$RECORD_DIR_VAR"
-  echo "Recordings will be written to: $RECORD_DIR_VAR"
+  info "Recordings → $RECORD_DIR_VAR"
 fi
 
 systemctl daemon-reload
@@ -126,7 +165,7 @@ sleep 2
 say "Agent status:"
 systemctl --no-pager --lines=3 status secureops-agent || true
 
-LAN_IP=$(hostname -I | awk '{print $1}')
+LAN_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 TS_IP="${TS_IP:-}"
 USE_IP="${TS_IP:-$LAN_IP}"
 
@@ -134,9 +173,12 @@ echo
 echo -e "${GREEN}=====================================================${NC}"
 echo -e "${GREEN}  ✅ SecureOps Agent installed!${NC}"
 echo
+echo "  Distro:       $PRETTY"
 echo "  Hostname:     $(hostname)"
 echo "  IP for ctrl:  $USE_IP"
 echo "  Port:         $PORT"
+[[ -n "$SHELL_USER" ]] && echo "  Shell user:   $SHELL_USER (drop-privileges enabled)"
+[[ "$RECORD" == "1" ]] && echo "  Recording:    ON  ($RECORD_DIR_VAR)"
 echo
 echo "  In the Controller UI → Servers, edit this entry:"
 echo "    API URL:  http://$USE_IP:$PORT"

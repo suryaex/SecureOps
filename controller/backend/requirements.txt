@@ -1,16 +1,37 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-gunicorn==22.0.0
-sqlalchemy==2.0.35
-pydantic==2.9.2
-pydantic[email]==2.9.2
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
-bcrypt==4.1.2
-cryptography==44.0.0
-python-multipart==0.0.12
-python-pam==2.0.2
-psutil==5.9.8
-Pillow==10.4.0
-httpx==0.27.2
-websockets==13.1
+# SecureOps Controller — Python dependencies
+# Loosened ranges so it builds on Ubuntu 20.04 → 25.04, Debian 11 → 13,
+# and Python 3.10 → 3.13.
+
+# Web framework
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+gunicorn>=22.0,<24.0
+python-multipart>=0.0.9,<1.0
+
+# Data layer
+sqlalchemy>=2.0,<3.0
+pydantic>=2.5,<3.0
+pydantic[email]>=2.5,<3.0
+
+# Auth
+# IMPORTANT pairing: passlib 1.7.4 + bcrypt 4.x works but logs a warning.
+# We suppress that warning in auth.py — see _quiet_passlib_bcrypt() there.
+python-jose[cryptography]>=3.3,<4.0
+passlib[bcrypt]>=1.7.4,<2.0
+bcrypt>=4.0,<5.0
+cryptography>=42.0,<45.0
+
+# PAM (real Linux user authentication)
+python-pam>=2.0.2,<3.0
+
+# System telemetry
+psutil>=5.9,<7.0
+
+# HTTP (controller → agent)
+httpx>=0.25,<1.0
+
+# WebSocket (terminal proxy)
+websockets>=12.0,<15.0
+
+# Icon generation (one-time, deploy script)
+Pillow>=10.0,<12.0
