@@ -1,0 +1,47 @@
+{
+  "name": "secureops-frontend",
+  "version": "1.2.0",
+  "private": true,
+  "description": "SecureOps — Security Audit Dashboard (PWA + Mobile)",
+  "scripts": {
+    "dev":         "vite",
+    "build":       "vite build",
+    "preview":     "vite preview --host 0.0.0.0 --port 4173",
+    "lint":        "echo 'no lint configured'",
+    "cap:sync":    "npm run build && npx cap sync",
+    "cap:android": "npm run cap:sync && npx cap open android",
+    "cap:ios":     "npm run cap:sync && npx cap open ios",
+    "android:run": "npm run cap:sync && npx cap run android",
+    "ios:run":     "npm run cap:sync && npx cap run ios",
+    "android:apk": "npm run cap:sync && cd android && ./gradlew assembleRelease"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.2",
+    "recharts": "^2.13.0",
+    "xterm": "^5.3.0",
+    "xterm-addon-fit": "^0.8.0",
+    "xterm-addon-web-links": "^0.9.0",
+    "@capacitor/core": "^6.1.2",
+    "@capacitor/android": "^6.1.2",
+    "@capacitor/ios": "^6.1.2",
+    "@capacitor/app": "^6.0.1",
+    "@capacitor/network": "^6.0.2",
+    "@capacitor/status-bar": "^6.0.1",
+    "@capacitor/splash-screen": "^6.0.2",
+    "@capacitor/preferences": "^6.0.2"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.1.2",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.2",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.14",
+    "vite": "^5.4.9",
+    "vite-plugin-pwa": "^0.20.5"
+  }
+}

@@ -1,0 +1,36 @@
+[Unit]
+Description=SecureOps Backend (FastAPI + gunicorn)
+Documentation=https://github.com/suryaex/secureops
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Must run as root for PAM authentication on most distros
+User=root
+Group=root
+WorkingDirectory={{BACKEND_DIR}}
+
+Environment="PATH={{BACKEND_DIR}}/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+Environment="SECUREOPS_BEHIND_PROXY=1"
+Environment="SECUREOPS_CORS_ORIGINS=*"
+Environment="SECUREOPS_BIND=127.0.0.1:8000"
+Environment="SECUREOPS_WORKERS=2"
+
+ExecStart={{BACKEND_DIR}}/venv/bin/gunicorn -c {{BACKEND_DIR}}/gunicorn.conf.py main:app
+
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=secureops-backend
+
+# Hardening (relaxed since we need PAM + filesystem scanning)
+ProtectSystem=false
+ProtectHome=false
+PrivateTmp=true
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

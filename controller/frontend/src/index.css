@@ -1,0 +1,152 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ===========================================================
+   SecureOps · Luminous Security — Glassmorphism core
+   =========================================================== */
+
+@layer base {
+  * { box-sizing: border-box; -webkit-font-smoothing: antialiased; }
+
+  html, body {
+    background-color: #F9F9FF;
+    color: #181C23;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    font-feature-settings: 'cv11', 'ss01', 'ss03';
+  }
+
+  /* Subtle gradient haze in the background — gives the glass something to blur */
+  body {
+    background-image:
+      radial-gradient(at 100% 0%,  rgba(0, 122, 255, 0.10) 0%, transparent 50%),
+      radial-gradient(at 0% 100%,  rgba(173, 198, 255, 0.18) 0%, transparent 50%),
+      radial-gradient(at 50% 50%,  rgba(216, 226, 255, 0.10) 0%, transparent 70%);
+    background-attachment: fixed;
+  }
+
+  .material-symbols-outlined {
+    font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+    user-select: none;
+    line-height: 1;
+  }
+  .filled { font-variation-settings: 'FILL' 1, 'wght' 500; }
+
+  ::selection { background: #007AFF33; }
+
+  ::-webkit-scrollbar          { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track    { background: transparent; }
+  ::-webkit-scrollbar-thumb    { background: rgba(0,0,0,0.12); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.22); background-clip: padding-box; border: 2px solid transparent; }
+}
+
+@layer components {
+  /* --------- Glass surfaces --------- */
+  .glass {
+    background: rgba(255, 255, 255, 0.70);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    border: 1px solid rgba(255, 255, 255, 0.55);
+    box-shadow:
+      0 10px 30px rgba(0, 0, 0, 0.04),
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.55);
+  }
+  .glass-strong {
+    background: rgba(255, 255, 255, 0.85);
+    backdrop-filter: blur(30px) saturate(180%);
+    -webkit-backdrop-filter: blur(30px) saturate(180%);
+    border: 1px solid rgba(255, 255, 255, 0.6);
+  }
+  .glass-recess {
+    background: rgba(0, 0, 0, 0.04);
+    border: 1px solid rgba(0, 0, 0, 0.05);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.06);
+  }
+
+  /* --------- Cards --------- */
+  .card      { @apply glass rounded-lg; }
+  .card-flat { @apply bg-surface-lowest rounded-lg border border-outline-variant/40 shadow-card; }
+  .stat-card { @apply glass rounded-lg p-5 flex flex-col gap-3 transition-shadow hover:shadow-bloom-lg; }
+
+  /* --------- Tables --------- */
+  .data-table   { @apply w-full text-sm; }
+  .data-table thead th {
+    @apply px-4 py-3 text-left text-[11px] font-semibold text-ink-muted uppercase tracking-label
+           bg-white/40 backdrop-blur-xs first:rounded-tl-lg last:rounded-tr-lg
+           border-b border-outline-variant/40;
+  }
+  .data-table tbody tr {
+    @apply border-b border-outline-variant/20 hover:bg-primary/[0.04] transition-colors duration-100;
+  }
+  .data-table tbody td { @apply px-4 py-3 text-ink; }
+
+  /* --------- Buttons --------- */
+  .btn-primary {
+    @apply inline-flex items-center gap-2 bg-primary hover:bg-primary-hover active:bg-primary-dark
+           text-white text-sm font-semibold px-5 py-2.5 rounded
+           transition-all duration-150 shadow-sm
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-secondary {
+    @apply inline-flex items-center gap-2 glass-strong hover:bg-white/95
+           text-ink text-sm font-medium px-4 py-2.5 rounded
+           transition-all duration-150
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center gap-2 text-ink-muted hover:text-ink hover:bg-white/60
+           text-sm font-medium px-3 py-2 rounded transition-colors duration-150;
+  }
+  .btn-danger {
+    @apply inline-flex items-center gap-2 bg-danger hover:bg-danger-dark
+           text-white text-sm font-semibold px-4 py-2.5 rounded transition-colors duration-150 shadow-sm;
+  }
+
+  /* --------- Pills / Badges --------- */
+  .badge { @apply inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold; }
+  .badge-critical  { @apply badge bg-danger-light  text-danger  border border-danger-border/60; }
+  .badge-high      { @apply badge bg-warning-light text-warning border border-warning-border/60; }
+  .badge-medium    { @apply badge bg-yellow-50     text-yellow-700 border border-yellow-200; }
+  .badge-low       { @apply badge bg-primary-light text-primary border border-primary-border/60; }
+  .badge-safe      { @apply badge bg-success-light text-success-dark border border-success-border/60; }
+  .badge-modified  { @apply badge bg-danger-light  text-danger  border border-danger-border/60; }
+  .badge-missing   { @apply badge bg-warning-light text-warning border border-warning-border/60; }
+  .badge-active    { @apply badge bg-success-light text-success-dark border border-success-border/60; }
+  .badge-idle      { @apply badge bg-yellow-50     text-yellow-700 border border-yellow-200; }
+  .badge-locked    { @apply badge bg-danger-light  text-danger  border border-danger-border/60; }
+  .badge-success   { @apply badge bg-success-light text-success-dark border border-success-border/60; }
+  .badge-failed    { @apply badge bg-danger-light  text-danger  border border-danger-border/60; }
+  .badge-info      { @apply badge bg-info-light    text-info    border border-info-border; }
+  .badge-online    { @apply badge bg-success-light text-success-dark border border-success-border/60; }
+  .badge-offline   { @apply badge bg-danger-light  text-danger  border border-danger-border/60; }
+
+  /* --------- Inputs --------- */
+  .input {
+    @apply w-full bg-black/[0.04] border border-black/[0.06] text-ink placeholder-ink-muted/50
+           rounded px-4 py-2.5 text-sm shadow-inset-recess
+           focus:outline-none focus:bg-white focus:border-primary focus:ring-2 focus:ring-primary/30
+           focus:shadow-none transition-all;
+  }
+  .search-input { @apply input pl-10 rounded-full; }
+
+  /* --------- Avatar --------- */
+  .avatar {
+    @apply w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold text-white shrink-0
+           ring-2 ring-white/60;
+  }
+
+  /* --------- Misc --------- */
+  .action-tag { @apply inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium; }
+  .h-page { @apply text-[28px] font-bold tracking-tightest text-ink leading-tight; }
+  .h-card { @apply text-base font-semibold text-ink; }
+  .label-uppercase { @apply text-[11px] font-semibold uppercase tracking-label text-ink-muted; }
+
+  .nav-item        { @apply flex items-center gap-3 px-3 py-2.5 rounded text-sm font-medium transition-all duration-150; }
+  .nav-item-active { @apply bg-primary text-white shadow-[0_4px_14px_rgba(0,122,255,0.35)]; }
+  .nav-item-idle   { @apply text-ink-muted hover:text-ink hover:bg-white/70; }
+}
+
+@supports not ((backdrop-filter: blur(20px))) {
+  .glass        { background: rgba(255, 255, 255, 0.92); }
+  .glass-strong { background: rgba(255, 255, 255, 0.97); }
+}

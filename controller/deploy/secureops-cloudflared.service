@@ -1,0 +1,25 @@
+# Optional: expose your local nginx publicly through Cloudflare Tunnel
+# (no domain purchase, no port forwarding, free HTTPS).
+#
+# 1) Install:    https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/install-and-setup/installation/
+# 2) Auth:       cloudflared tunnel login
+# 3) Create:     cloudflared tunnel create secureops
+# 4) Configure:  /etc/cloudflared/config.yml  (see deploy/cloudflared-config.yml)
+# 5) Route:      cloudflared tunnel route dns secureops secureops.yourdomain.com
+# 6) Enable:     sudo systemctl enable --now secureops-cloudflared
+
+[Unit]
+Description=SecureOps Cloudflare Tunnel
+After=network.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cloudflared
+Group=cloudflared
+ExecStart=/usr/local/bin/cloudflared --config /etc/cloudflared/config.yml tunnel run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
