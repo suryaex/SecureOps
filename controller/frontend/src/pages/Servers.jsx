@@ -188,6 +188,294 @@ function Stat({ label, value, icon, bg }) {
 }
 
 function AddServerModal({ onClose, onSaved }) {
+  // 2 modes: 'quick' (auto-join via token) or 'manual' (paste API URL + key)
+  const [mode, setMode] = useState('quick')
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-2xl overflow-hidden max-h-[90vh] flex flex-col">
+        <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between shrink-0">
+          <h3 className="text-gray-800 font-semibold flex items-center gap-2">
+            <span className="material-symbols-outlined text-primary">add_to_queue</span>
+            Add a new server
+          </h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-700">
+            <span className="material-symbols-outlined">close</span>
+          </button>
+        </div>
+
+        {/* Mode switcher */}
+        <div className="px-5 pt-4 pb-1 shrink-0">
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              onClick={() => setMode('quick')}
+              className={`px-4 py-3 rounded-xl text-sm font-semibold border-2 transition-all ${
+                mode === 'quick'
+                  ? 'bg-primary/10 border-primary text-primary'
+                  : 'bg-white border-gray-200 text-gray-600 hover:border-gray-300'
+              }`}
+            >
+              <div className="flex items-center justify-center gap-2 mb-1">
+                <span className="material-symbols-outlined">bolt</span>
+                <span>One-Liner (Recommended)</span>
+              </div>
+              <p className="text-[11px] font-normal opacity-75">
+                Agent auto-registers itself. Zero copy-paste.
+              </p>
+            </button>
+            <button
+              onClick={() => setMode('manual')}
+              className={`px-4 py-3 rounded-xl text-sm font-semibold border-2 transition-all ${
+                mode === 'manual'
+                  ? 'bg-primary/10 border-primary text-primary'
+                  : 'bg-white border-gray-200 text-gray-600 hover:border-gray-300'
+              }`}
+            >
+              <div className="flex items-center justify-center gap-2 mb-1">
+                <span className="material-symbols-outlined">edit</span>
+                <span>Manual Entry</span>
+              </div>
+              <p className="text-[11px] font-normal opacity-75">
+                Paste API URL & Key from existing agent.
+              </p>
+            </button>
+          </div>
+        </div>
+
+        <div className="overflow-y-auto flex-1">
+          {mode === 'quick'
+            ? <QuickJoinFlow onClose={onClose} onSaved={onSaved} />
+            : <ManualEntryForm onClose={onClose} onSaved={onSaved} />
+          }
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+/* ============================================================
+   QUICK JOIN (NEW) — Token-based one-liner
+   ============================================================ */
+function QuickJoinFlow({ onClose, onSaved }) {
+  // Sub-states:
+  //  'form'      = user fills name & tags
+  //  'waiting'   = command generated, polling for agent to join
+  //  'done'      = agent reported in — success
+  const [step, setStep] = useState('form')
+  const [form, setForm] = useState({ name: '', tags: '' })
+  const [tokenData, setTokenData] = useState(null)   // { token, install_command, expires_at, ... }
+  const [status, setStatus] = useState(null)         // poll status
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const [copied, setCopied] = useState(false)
+  const [secondsLeft, setSecondsLeft] = useState(0)
+
+  // Generate token
+  const generate = async (e) => {
+    e?.preventDefault?.()
+    setErr(''); setBusy(true)
+    try {
+      const { data } = await api.post('/servers/join-token', {
+        name: form.name.trim(),
+        tags: form.tags.trim(),
+      })
+      setTokenData(data)
+      setStep('waiting')
+    } catch (e2) {
+      setErr(e2.response?.data?.detail || 'Failed to create install token')
+    } finally { setBusy(false) }
+  }
+
+  // Poll status every 2s while waiting
+  useEffect(() => {
+    if (step !== 'waiting' || !tokenData) return
+    let cancelled = false
+    const poll = async () => {
+      try {
+        const { data } = await api.get(`/servers/join-token/${tokenData.token}/status`)
+        if (cancelled) return
+        setStatus(data)
+        if (data.status === 'registered') {
+          setStep('done')
+          // notify parent (without closing — let user see success)
+          onSaved && onSaved({ id: data.server_id })
+        }
+      } catch {}
+    }
+    poll()
+    const t = setInterval(poll, 2000)
+    return () => { cancelled = true; clearInterval(t) }
+  }, [step, tokenData])  // eslint-disable-line
+
+  // Countdown timer
+  useEffect(() => {
+    if (!tokenData?.expires_at) return
+    const tick = () => {
+      const left = Math.max(0, Math.floor((new Date(tokenData.expires_at).getTime() - Date.now()) / 1000))
+      setSecondsLeft(left)
+    }
+    tick()
+    const t = setInterval(tick, 1000)
+    return () => clearInterval(t)
+  }, [tokenData])
+
+  const copy = () => {
+    navigator.clipboard.writeText(tokenData.install_command)
+    setCopied(true); setTimeout(() => setCopied(false), 2000)
+  }
+
+  const fmtTime = (s) => {
+    const m = Math.floor(s / 60), sec = s % 60
+    return `${m}:${sec.toString().padStart(2, '0')}`
+  }
+
+  // ----- STEP 1: form -----
+  if (step === 'form') {
+    return (
+      <form onSubmit={generate} className="p-5 space-y-4">
+        {err && <p className="text-danger text-sm px-3 py-2 bg-danger-light border border-danger-border rounded-lg">{err}</p>}
+
+        <div className="bg-gradient-to-br from-primary/5 to-primary/10 border border-primary/20 rounded-xl p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="material-symbols-outlined text-primary">bolt</span>
+            <p className="text-sm font-semibold text-gray-800">How it works</p>
+          </div>
+          <ol className="text-xs text-gray-600 space-y-1.5 ml-1 list-decimal list-inside">
+            <li>Pick a name for your new server below</li>
+            <li>Copy the one-liner command (next screen)</li>
+            <li>Paste it on the target server's terminal</li>
+            <li>Agent installs itself and auto-registers — server appears here</li>
+          </ol>
+        </div>
+
+        <FormField label="Server name" required>
+          <input
+            value={form.name}
+            onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
+            placeholder="web-prod-01"
+            required
+            minLength={1}
+            maxLength={100}
+            spellCheck="false"
+            autoComplete="off"
+            className="input"
+          />
+          <p className="text-[11px] text-gray-400 mt-1">Must be unique. Use lowercase letters, digits, and dashes.</p>
+        </FormField>
+
+        <FormField label="Tags (optional, comma-separated)">
+          <input
+            value={form.tags}
+            onChange={e => setForm(f => ({ ...f, tags: e.target.value }))}
+            placeholder="production, web, db"
+            className="input"
+          />
+        </FormField>
+
+        <div className="flex gap-2 pt-2">
+          <button type="submit" disabled={busy} className="btn-primary flex-1 justify-center">
+            {busy ? (
+              <><span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />Generating…</>
+            ) : (
+              <><span className="material-symbols-outlined text-lg">arrow_forward</span>Generate install command</>
+            )}
+          </button>
+          <button type="button" onClick={onClose} className="btn-secondary">Cancel</button>
+        </div>
+      </form>
+    )
+  }
+
+  // ----- STEP 2: waiting -----
+  if (step === 'waiting') {
+    return (
+      <div className="p-5 space-y-4">
+        <div className="bg-blue-50 border border-blue-200 rounded-xl p-3">
+          <p className="text-xs text-blue-900 font-semibold mb-2 flex items-center gap-1.5">
+            <span className="material-symbols-outlined text-base">terminal</span>
+            Run this on the new server&nbsp;<b>{tokenData.name}</b>
+          </p>
+          <div className="relative">
+            <pre className="bg-gray-900 text-green-300 text-xs font-mono p-3 pr-12 rounded-lg overflow-x-auto leading-relaxed whitespace-pre-wrap break-all">
+              {tokenData.install_command}
+            </pre>
+            <button
+              onClick={copy}
+              className="absolute top-2 right-2 bg-gray-800 hover:bg-gray-700 text-white p-2 rounded-md transition-colors"
+              title="Copy"
+            >
+              <span className="material-symbols-outlined text-base">{copied ? 'check' : 'content_copy'}</span>
+            </button>
+          </div>
+          <p className="text-[11px] text-blue-700 mt-2">
+            Token expires in {fmtTime(secondsLeft)}. Server name reserved as <code className="bg-blue-100 px-1 rounded">{tokenData.name}</code>.
+          </p>
+        </div>
+
+        {/* Waiting indicator */}
+        <div className="border-2 border-dashed border-primary/40 rounded-xl p-6 text-center">
+          <div className="inline-flex items-center justify-center w-14 h-14 bg-primary/10 rounded-full mb-3">
+            <span className="w-8 h-8 border-3 border-primary/30 border-t-primary rounded-full animate-spin" />
+          </div>
+          <p className="text-gray-800 font-medium text-sm">Waiting for the agent to register…</p>
+          <p className="text-gray-500 text-xs mt-1">This window auto-detects when the agent reports in.</p>
+          {status?.status === 'expired' && (
+            <p className="text-danger text-xs mt-2 font-semibold">⚠ Token expired. Please generate a new one.</p>
+          )}
+        </div>
+
+        <div className="flex gap-2">
+          <button
+            onClick={() => setStep('form')}
+            className="btn-secondary flex-1 justify-center"
+          >
+            <span className="material-symbols-outlined text-lg">refresh</span>
+            Generate new token
+          </button>
+          <button onClick={onClose} className="btn-ghost">Close</button>
+        </div>
+      </div>
+    )
+  }
+
+  // ----- STEP 3: done -----
+  return (
+    <div className="p-8 text-center space-y-4">
+      <div className="inline-flex items-center justify-center w-16 h-16 bg-success-light rounded-full">
+        <span className="material-symbols-outlined text-success text-4xl filled">check_circle</span>
+      </div>
+      <div>
+        <p className="text-xl font-bold text-gray-900">Server connected!</p>
+        <p className="text-gray-500 text-sm mt-1">
+          <b>{status?.server_name || tokenData.name}</b> is now in your fleet.
+        </p>
+      </div>
+      {status?.api_url && (
+        <p className="text-xs text-gray-400 font-mono">{status.api_url}</p>
+      )}
+      <div className="flex gap-2 justify-center pt-2">
+        <button onClick={onClose} className="btn-primary">
+          <span className="material-symbols-outlined text-lg">done</span>
+          Got it
+        </button>
+        <button
+          onClick={() => { setStep('form'); setForm({ name: '', tags: '' }); setTokenData(null); setStatus(null) }}
+          className="btn-secondary"
+        >
+          <span className="material-symbols-outlined text-lg">add</span>
+          Add another
+        </button>
+      </div>
+    </div>
+  )
+}
+
+
+/* ============================================================
+   MANUAL ENTRY (legacy fallback) — Paste API URL + Key
+   ============================================================ */
+function ManualEntryForm({ onClose, onSaved }) {
   const [form, setForm] = useState({ name: '', hostname: '', api_url: '', tags: '', api_key: '' })
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
@@ -208,116 +496,77 @@ function AddServerModal({ onClose, onSaved }) {
   }
 
   return (
-    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl shadow-xl w-full max-w-xl overflow-hidden">
-        <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
-          <h3 className="text-gray-800 font-semibold flex items-center gap-2">
-            <span className="material-symbols-outlined text-primary">add_to_queue</span>
-            Register New Server
-          </h3>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-700">
-            <span className="material-symbols-outlined">close</span>
-          </button>
-        </div>
+    <form onSubmit={submit} className="p-5 space-y-4">
+      {err && <p className="text-danger text-sm px-3 py-2 bg-danger-light border border-danger-border rounded-lg">{err}</p>}
 
-        {/* Instructions panel */}
-        <div className="px-5 py-3 bg-blue-50 border-b border-blue-100">
-          <p className="text-xs text-blue-900 font-semibold mb-1.5 flex items-center gap-1.5">
-            <span className="material-symbols-outlined text-base">terminal</span>
-            Install the agent first, then paste below
-          </p>
-          <pre className="bg-blue-900 text-green-300 text-[11px] font-mono p-2.5 rounded-md overflow-x-auto leading-relaxed">
-{`sudo bash <(curl -fsSL https://raw.githubusercontent.com/suryaex/secureops/main/agent/deploy/install.sh)`}
-          </pre>
-          <p className="text-[11px] text-blue-700 mt-1.5 leading-snug">
-            The installer auto-generates an API key on the agent server. Copy <b>API URL</b> & <b>API Key</b> from its final output, then paste them into the form below.
-          </p>
-        </div>
-
-        <form onSubmit={submit} className="p-5 space-y-4">
-          {err && <p className="text-danger text-sm px-3 py-2 bg-danger-light border border-danger-border rounded-lg">{err}</p>}
-
-          <div className="grid grid-cols-2 gap-3">
-            <FormField label="Server name" required>
-              <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="web-prod-01" required className="input" />
-            </FormField>
-
-            <FormField label="Hostname (display)">
-              <input value={form.hostname} onChange={e => setForm(f => ({ ...f, hostname: e.target.value }))} placeholder="(defaults to name)" className="input" />
-            </FormField>
-          </div>
-
-          <FormField label="API URL — from agent installer output" required>
-            <input
-              value={form.api_url}
-              onChange={e => setForm(f => ({ ...f, api_url: e.target.value }))}
-              placeholder="http://100.64.10.12:8001"
-              required
-              className="input font-mono text-xs"
-              spellCheck="false"
-              autoComplete="off"
-            />
-          </FormField>
-
-          <FormField label="API Key — from agent installer output" required>
-            <div className="relative">
-              <input
-                type={showKey ? 'text' : 'password'}
-                value={form.api_key}
-                onChange={e => setForm(f => ({ ...f, api_key: e.target.value }))}
-                placeholder="paste 43-char token from agent..."
-                required
-                minLength={20}
-                className="input font-mono text-xs pr-20"
-                spellCheck="false"
-                autoComplete="off"
-              />
-              <div className="absolute right-2 top-1/2 -translate-y-1/2 flex gap-1">
-                <button
-                  type="button"
-                  onClick={() => setShowKey(s => !s)}
-                  className="text-gray-400 hover:text-gray-700 p-1"
-                  title={showKey ? 'Hide' : 'Show'}
-                >
-                  <span className="material-symbols-outlined text-base">{showKey ? 'visibility_off' : 'visibility'}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={async () => {
-                    try {
-                      const text = await navigator.clipboard.readText()
-                      if (text) setForm(f => ({ ...f, api_key: text.trim() }))
-                    } catch {}
-                  }}
-                  className="text-gray-400 hover:text-primary p-1"
-                  title="Paste from clipboard"
-                >
-                  <span className="material-symbols-outlined text-base">content_paste</span>
-                </button>
-              </div>
-            </div>
-            <p className="text-[11px] text-gray-400 mt-1">
-              Tip: in agent's terminal run <code className="bg-gray-100 px-1 rounded font-mono">sudo cat /etc/secureops-agent/key</code> if you forgot to copy.
-            </p>
-          </FormField>
-
-          <FormField label="Tags (optional, comma-separated)">
-            <input value={form.tags} onChange={e => setForm(f => ({ ...f, tags: e.target.value }))} placeholder="production, web, db" className="input" />
-          </FormField>
-
-          <div className="flex gap-2 pt-2">
-            <button type="submit" disabled={busy} className="btn-primary flex-1 justify-center">
-              {busy ? (
-                <><span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />Registering…</>
-              ) : (
-                <><span className="material-symbols-outlined text-lg">add</span>Register & Connect</>
-              )}
-            </button>
-            <button type="button" onClick={onClose} className="btn-secondary">Cancel</button>
-          </div>
-        </form>
+      <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 text-xs text-gray-600">
+        Use this when the agent is already installed on the target server. Paste its API URL & Key from the installer output (or run <code className="bg-gray-200 px-1 rounded">sudo cat /etc/secureops-agent/key</code> to retrieve later).
       </div>
-    </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <FormField label="Server name" required>
+          <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="web-prod-01" required className="input" />
+        </FormField>
+        <FormField label="Hostname (display)">
+          <input value={form.hostname} onChange={e => setForm(f => ({ ...f, hostname: e.target.value }))} placeholder="(defaults to name)" className="input" />
+        </FormField>
+      </div>
+
+      <FormField label="API URL" required>
+        <input
+          value={form.api_url}
+          onChange={e => setForm(f => ({ ...f, api_url: e.target.value }))}
+          placeholder="http://100.64.10.12:8001"
+          required
+          className="input font-mono text-xs"
+          spellCheck="false"
+          autoComplete="off"
+        />
+      </FormField>
+
+      <FormField label="API Key" required>
+        <div className="relative">
+          <input
+            type={showKey ? 'text' : 'password'}
+            value={form.api_key}
+            onChange={e => setForm(f => ({ ...f, api_key: e.target.value }))}
+            placeholder="43-char token from agent"
+            required
+            minLength={20}
+            className="input font-mono text-xs pr-20"
+            spellCheck="false"
+            autoComplete="off"
+          />
+          <div className="absolute right-2 top-1/2 -translate-y-1/2 flex gap-1">
+            <button type="button" onClick={() => setShowKey(s => !s)} className="text-gray-400 hover:text-gray-700 p-1">
+              <span className="material-symbols-outlined text-base">{showKey ? 'visibility_off' : 'visibility'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={async () => { try { const t = await navigator.clipboard.readText(); if (t) setForm(f => ({ ...f, api_key: t.trim() })) } catch {} }}
+              className="text-gray-400 hover:text-primary p-1" title="Paste from clipboard"
+            >
+              <span className="material-symbols-outlined text-base">content_paste</span>
+            </button>
+          </div>
+        </div>
+      </FormField>
+
+      <FormField label="Tags (optional, comma-separated)">
+        <input value={form.tags} onChange={e => setForm(f => ({ ...f, tags: e.target.value }))} placeholder="production, web, db" className="input" />
+      </FormField>
+
+      <div className="flex gap-2 pt-2">
+        <button type="submit" disabled={busy} className="btn-primary flex-1 justify-center">
+          {busy ? (
+            <><span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />Registering…</>
+          ) : (
+            <><span className="material-symbols-outlined text-lg">add</span>Register & Connect</>
+          )}
+        </button>
+        <button type="button" onClick={onClose} className="btn-secondary">Cancel</button>
+      </div>
+    </form>
   )
 }
 

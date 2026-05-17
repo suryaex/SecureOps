@@ -5,17 +5,31 @@ Only available on the Controller (not on Agents).
 Admin role required for create/update/delete; auditors can list & ping.
 """
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from database import get_db
+from database import get_db, SessionLocal
 import models
 from auth import get_current_user, require_admin
 from agent_client import ping_agent, ping_all
+
+# In-memory join token store (1 hour TTL)
+# Format: {token_str: {name, tags, expires_at, used, used_at, server_id}}
+_JOIN_TOKENS: dict = {}
+_JOIN_TOKEN_TTL_HOURS = 1
+
+
+def _cleanup_expired_tokens():
+    """Drop tokens older than 24 hours from memory."""
+    cutoff = datetime.utcnow() - timedelta(hours=24)
+    for t in list(_JOIN_TOKENS.keys()):
+        if _JOIN_TOKENS[t]["expires_at"] < cutoff:
+            del _JOIN_TOKENS[t]
 
 router = APIRouter()
 
@@ -196,3 +210,211 @@ async def ping_one(server_id: int, db: Session = Depends(get_db),
 async def ping_everyone(db: Session = Depends(get_db),
                         _user=Depends(get_current_user)):
     return await ping_all(db)
+
+
+# =====================================================================
+#  AUTO-REGISTRATION FLOW (v1.5+)
+#
+#  3 endpoints together implement zero-touch agent join:
+#  1. POST /join-token  → admin creates a one-time token in UI
+#  2. GET  /install-script/{token}  → agent downloads personalized script
+#  3. POST /auto-register  → agent calls back after install to self-register
+# =====================================================================
+
+class JoinTokenCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    tags: Optional[str] = ""
+
+
+@router.post("/join-token")
+def create_join_token(body: JoinTokenCreate, request: Request,
+                      db: Session = Depends(get_db),
+                      current=Depends(require_admin)):
+    """Admin creates a one-time join token. Returns the install command."""
+    _cleanup_expired_tokens()
+
+    # Make sure name isn't already taken
+    if db.query(models.MonitoredServer).filter(models.MonitoredServer.name == body.name).first():
+        raise HTTPException(409, f"Server name '{body.name}' already exists")
+
+    # Check pending tokens for same name
+    for existing in _JOIN_TOKENS.values():
+        if existing["name"] == body.name and not existing["used"] and existing["expires_at"] > datetime.utcnow():
+            raise HTTPException(409, f"A pending join token for '{body.name}' already exists. Wait for it to expire (max {_JOIN_TOKEN_TTL_HOURS}h) or pick another name.")
+
+    token = secrets.token_urlsafe(24)
+    expires_at = datetime.utcnow() + timedelta(hours=_JOIN_TOKEN_TTL_HOURS)
+
+    _JOIN_TOKENS[token] = {
+        "name":       body.name,
+        "tags":       (body.tags or "").strip(),
+        "expires_at": expires_at,
+        "used":       False,
+        "used_at":    None,
+        "server_id":  None,
+        "created_by": current.username,
+    }
+
+    # Build absolute public URL from request (Cloudflare / nginx already sets X-Forwarded-Proto)
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host  = request.headers.get("x-forwarded-host",  request.headers.get("host", "localhost"))
+    base  = f"{proto}://{host}"
+
+    one_liner = (
+        f'curl -fsSL "{base}/api/servers/install-script/{token}" | sudo bash'
+    )
+
+    db.add(models.AdminActivityLog(
+        admin_id=getattr(current, "id", None),
+        admin_username=current.username,
+        action="Create Join Token",
+        details=f"Token for '{body.name}' (expires {expires_at.isoformat()})",
+        ip_address=request.client.host or "unknown",
+        status="success",
+    ))
+    db.commit()
+
+    return {
+        "token":           token,
+        "name":            body.name,
+        "tags":            body.tags or "",
+        "expires_at":      expires_at.isoformat() + "Z",
+        "ttl_seconds":     int((expires_at - datetime.utcnow()).total_seconds()),
+        "install_command": one_liner,
+        "controller_url":  base,
+    }
+
+
+@router.get("/join-token/{token}/status")
+def join_token_status(token: str, db: Session = Depends(get_db),
+                      _user=Depends(get_current_user)):
+    """Polled by the UI to check if the agent has registered yet."""
+    tok = _JOIN_TOKENS.get(token)
+    if not tok:
+        raise HTTPException(404, "Token not found")
+
+    if tok["used"] and tok["server_id"]:
+        srv = db.query(models.MonitoredServer).filter(models.MonitoredServer.id == tok["server_id"]).first()
+        return {
+            "status":      "registered",
+            "used":        True,
+            "server_id":   tok["server_id"],
+            "server_name": srv.name if srv else tok["name"],
+            "hostname":    srv.hostname if srv else None,
+            "api_url":     srv.api_url if srv else None,
+            "last_status": srv.last_status if srv else None,
+        }
+
+    if tok["expires_at"] < datetime.utcnow():
+        return {"status": "expired", "used": False}
+
+    return {
+        "status":     "pending",
+        "used":       False,
+        "expires_at": tok["expires_at"].isoformat() + "Z",
+    }
+
+
+@router.get("/install-script/{token}", response_class=PlainTextResponse)
+def get_install_script(token: str, request: Request):
+    """PUBLIC endpoint — agent downloads a personalized install bootstrap script."""
+    tok = _JOIN_TOKENS.get(token)
+    if not tok:
+        raise HTTPException(404, "Invalid token")
+    if tok["used"]:
+        raise HTTPException(410, "Token already used")
+    if tok["expires_at"] < datetime.utcnow():
+        raise HTTPException(410, "Token expired")
+
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host  = request.headers.get("x-forwarded-host",  request.headers.get("host", "localhost"))
+    base  = f"{proto}://{host}"
+
+    # Self-contained bootstrap script. Runs as root via `| sudo bash`.
+    script = f"""#!/usr/bin/env bash
+# SecureOps Agent — auto-registration bootstrap
+# Generated for: {tok['name']}
+# Expires:       {tok['expires_at'].isoformat()}Z
+set -euo pipefail
+
+export SECUREOPS_CONTROLLER_URL="{base}"
+export SECUREOPS_JOIN_TOKEN="{token}"
+export SECUREOPS_SERVER_NAME="{tok['name']}"
+export SECUREOPS_TAGS="{tok['tags']}"
+export SECUREOPS_SHELL_USER="${{SECUREOPS_SHELL_USER:-secureops}}"
+export SECUREOPS_RECORD_SESSIONS="${{SECUREOPS_RECORD_SESSIONS:-1}}"
+
+# Ensure shell user exists (idempotent)
+id "$SECUREOPS_SHELL_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$SECUREOPS_SHELL_USER"
+
+# Download main installer
+echo "==> Downloading main installer..."
+curl -fsSL https://raw.githubusercontent.com/suryaex/secureops/main/agent/deploy/install.sh -o /tmp/secureops-install.sh
+
+# Run it — the installer will call back to {base}/api/servers/auto-register
+bash /tmp/secureops-install.sh
+"""
+
+    return PlainTextResponse(content=script, media_type="text/x-shellscript")
+
+
+class AutoRegisterBody(BaseModel):
+    token:    str
+    hostname: str = Field(..., max_length=200)
+    api_url:  str = Field(..., max_length=300)
+    api_key:  str = Field(..., min_length=20, max_length=200)
+
+
+@router.post("/auto-register")
+def auto_register(body: AutoRegisterBody, request: Request,
+                  db: Session = Depends(get_db)):
+    """
+    PUBLIC endpoint — called by the agent at the end of install to self-register.
+    Consumes the one-time join token and creates a MonitoredServer row.
+    """
+    tok = _JOIN_TOKENS.get(body.token)
+    if not tok:
+        raise HTTPException(404, "Invalid token")
+    if tok["used"]:
+        raise HTTPException(410, "Token already used")
+    if tok["expires_at"] < datetime.utcnow():
+        raise HTTPException(410, "Token expired")
+
+    # Double-check name still free (race condition guard)
+    if db.query(models.MonitoredServer).filter(models.MonitoredServer.name == tok["name"]).first():
+        raise HTTPException(409, f"Server name '{tok['name']}' was registered by someone else")
+
+    srv = models.MonitoredServer(
+        name=tok["name"],
+        hostname=body.hostname.strip(),
+        api_url=body.api_url.rstrip("/"),
+        api_key=body.api_key,
+        tags=tok["tags"],
+        enabled=True,
+        is_local=False,
+        last_status="online",
+        last_seen=datetime.utcnow(),
+    )
+    db.add(srv)
+    db.commit()
+    db.refresh(srv)
+
+    tok["used"]      = True
+    tok["used_at"]   = datetime.utcnow()
+    tok["server_id"] = srv.id
+
+    db.add(models.AdminActivityLog(
+        admin_id=None,
+        admin_username=f"agent:{srv.name}",
+        action="Auto-Register Server",
+        details=f"Agent '{srv.name}' joined via token ({body.api_url})",
+        ip_address=request.client.host or "unknown",
+        status="success",
+    ))
+    db.commit()
+
+    return {
+        "status":       "registered",
+        "server_id":    srv.id,
+        "server_name":  srv.name,
+    }

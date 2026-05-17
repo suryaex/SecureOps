@@ -186,7 +186,16 @@ fi
 systemctl daemon-reload
 systemctl enable secureops-agent
 systemctl restart secureops-agent
-sleep 2
+
+# Wait for service to actually be ready (up to 15s)
+say "Waiting for agent to become healthy..."
+for i in {1..15}; do
+  if curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/api/health" 2>/dev/null; then
+    info "Agent is healthy after ${i}s"
+    break
+  fi
+  sleep 1
+done
 
 say "Agent status:"
 systemctl --no-pager --lines=3 status secureops-agent || true
@@ -194,6 +203,38 @@ systemctl --no-pager --lines=3 status secureops-agent || true
 LAN_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 TS_IP="${TS_IP:-}"
 USE_IP="${TS_IP:-$LAN_IP}"
+AUTO_REGISTERED=0
+
+# ---------- Auto-registration to controller (if join token provided) ----------
+if [[ -n "${SECUREOPS_JOIN_TOKEN:-}" && -n "${SECUREOPS_CONTROLLER_URL:-}" ]]; then
+  say "Auto-registering with controller at $SECUREOPS_CONTROLLER_URL ..."
+
+  REGISTER_PAYLOAD=$(cat <<EOF
+{
+  "token":    "$SECUREOPS_JOIN_TOKEN",
+  "hostname": "$(hostname)",
+  "api_url":  "http://$USE_IP:$PORT",
+  "api_key":  "$KEY"
+}
+EOF
+)
+
+  REGISTER_RESPONSE=$(curl -fsS -X POST \
+    -H "Content-Type: application/json" \
+    -d "$REGISTER_PAYLOAD" \
+    --max-time 10 \
+    "$SECUREOPS_CONTROLLER_URL/api/servers/auto-register" 2>&1 || echo "FAILED:$?")
+
+  if [[ "$REGISTER_RESPONSE" == FAILED:* ]]; then
+    warn "Auto-registration failed: $REGISTER_RESPONSE"
+    warn "You can still register manually in the controller UI using:"
+    warn "  API URL: http://$USE_IP:$PORT"
+    warn "  API Key: $KEY"
+  else
+    info "Auto-registration response: $REGISTER_RESPONSE"
+    AUTO_REGISTERED=1
+  fi
+fi
 
 echo
 echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
@@ -205,20 +246,34 @@ echo -e "  Hostname:     $(hostname)"
 [[ -n "$SHELL_USER" ]] && echo -e "  Shell user:   ${BLUE}$SHELL_USER${NC} (drop-privileges enabled)"
 [[ "$RECORD" == "1" ]] && echo -e "  Recording:    ${BLUE}ON${NC}  ($RECORD_DIR_VAR)"
 echo
-echo -e "${YELLOW}┌──────────────────────────────────────────────────────────────┐${NC}"
-echo -e "${YELLOW}│       📋 PASTE THESE TO THE CONTROLLER UI                    │${NC}"
-echo -e "${YELLOW}│       (Sidebar → Servers → Add Server)                       │${NC}"
-echo -e "${YELLOW}└──────────────────────────────────────────────────────────────┘${NC}"
-echo
-echo -e "  ${BLUE}Name${NC}     :  $(hostname)"
-echo -e "  ${BLUE}API URL${NC}  :  ${GREEN}http://$USE_IP:$PORT${NC}"
-echo -e "  ${BLUE}API Key${NC}  :  ${GREEN}$KEY${NC}"
-echo
-if [[ "$GENERATED_KEY" == "1" ]]; then
-  echo -e "  ${YELLOW}⚠  This key was auto-generated. Copy it now —${NC}"
-  echo -e "  ${YELLOW}    you can also find it later at:  $KEY_FILE${NC}"
+
+if [[ "$AUTO_REGISTERED" == "1" ]]; then
+  # Zero-touch path — already registered with controller
+  echo -e "${GREEN}┌──────────────────────────────────────────────────────────────┐${NC}"
+  echo -e "${GREEN}│       🎉 AUTO-REGISTERED WITH CONTROLLER                     │${NC}"
+  echo -e "${GREEN}│       No further action needed — agent is online!            │${NC}"
+  echo -e "${GREEN}└──────────────────────────────────────────────────────────────┘${NC}"
+  echo
+  echo -e "  Controller:   ${BLUE}$SECUREOPS_CONTROLLER_URL${NC}"
+  echo -e "  Registered as: ${BLUE}${SECUREOPS_SERVER_NAME:-$(hostname)}${NC}"
+  echo -e "  API URL:      http://$USE_IP:$PORT"
 else
-  echo -e "  Key reused/provided (see $KEY_FILE)"
+  # Manual path — show info to paste in UI
+  echo -e "${YELLOW}┌──────────────────────────────────────────────────────────────┐${NC}"
+  echo -e "${YELLOW}│       📋 PASTE THESE TO THE CONTROLLER UI                    │${NC}"
+  echo -e "${YELLOW}│       (Sidebar → Servers → Add Server)                       │${NC}"
+  echo -e "${YELLOW}└──────────────────────────────────────────────────────────────┘${NC}"
+  echo
+  echo -e "  ${BLUE}Name${NC}     :  $(hostname)"
+  echo -e "  ${BLUE}API URL${NC}  :  ${GREEN}http://$USE_IP:$PORT${NC}"
+  echo -e "  ${BLUE}API Key${NC}  :  ${GREEN}$KEY${NC}"
+  echo
+  if [[ "$GENERATED_KEY" == "1" ]]; then
+    echo -e "  ${YELLOW}⚠  This key was auto-generated. Copy it now —${NC}"
+    echo -e "  ${YELLOW}    you can also find it later at:  $KEY_FILE${NC}"
+  else
+    echo -e "  Key reused/provided (see $KEY_FILE)"
+  fi
 fi
 echo
 echo -e "  Logs:  ${BLUE}sudo journalctl -u secureops-agent -f${NC}"

@@ -29,6 +29,7 @@
 
 **👉 [INSTALL.md](INSTALL.md)** — full step-by-step (English)
 **👉 [PANDUAN-INSTALASI.md](PANDUAN-INSTALASI.md)** — panduan lengkap dalam Bahasa Indonesia (testing VM → production `secureops.site`)
+**👉 [PANDUAN-TAMBAH-SERVER.md](PANDUAN-TAMBAH-SERVER.md)** — 🆕 panduan visual nambah agent baru (1 command!)
 
 TL;DR:
 
