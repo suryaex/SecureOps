@@ -1,494 +1,210 @@
-# 📘 Panduan Instalasi SecureOps — `secureops.site`
+# 📘 Panduan Instalasi SecureOps v1.5
 
-Panduan lengkap deployment SecureOps untuk **State Polytechnic of Sriwijaya** dengan domain `secureops.site` (Rumahweb). Dibagi 2 tahap: testing di VM dulu, baru migrasi ke server produksi.
+> **Untuk siapa**: Pemula yang baru pertama kali deploy. Ikuti baris per baris — pasti jadi.
+> **Target**: Domain `secureops.site` (Rumahweb), monitor banyak server Linux dari 1 tempat.
+> **Waktu**: ~30 menit total kalau lancar.
 
 ---
 
-## ✅ Distro yang Didukung
+## 🗺️ Big Picture — Apa yang Akan Kamu Bangun
 
-Installer otomatis mendeteksi distro dan menyesuaikan langkah-langkahnya. Versi yang **sudah ditest**:
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│          🌍 INTERNET                                             │
+│             │                                                    │
+│             ▼                                                    │
+│       https://secureops.site                                     │
+│             │                                                    │
+│             │ (Cloudflare Tunnel — HTTPS gratis, no port forward)│
+│             ▼                                                    │
+│   ╔═══════════════════════╗                                     │
+│   ║   CONTROLLER SERVER   ║   ← UI + database + central API     │
+│   ║   1 unit, public      ║                                      │
+│   ╚═══════════════════════╝                                     │
+│             │                                                    │
+│             │ (Tailscale mesh, encrypted)                        │
+│   ┌─────────┼─────────┐                                          │
+│   ▼         ▼         ▼                                          │
+│ ┌────┐    ┌────┐    ┌────┐                                       │
+│ │AGT │    │AGT │    │AGT │  ← agent kecil, install di tiap       │
+│ │ 1  │    │ 2  │    │ N  │     server yang mau dimonitor         │
+│ └────┘    └────┘    └────┘                                       │
+│  web      database  backup                                       │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+```
 
-| Distro                | Versi Didukung           | Python default | Catatan |
-|-----------------------|--------------------------|----------------|---------|
-| **Ubuntu Server**     | 20.04 / 22.04 / **24.04** / 25.04 | 3.8 → 3.12 | Direkomendasikan: 22.04 LTS atau 24.04 LTS |
-| **Debian**            | 11 (Bullseye) / 12 (Bookworm) / 13 (Trixie) | 3.9 → 3.13 | Stable, ringan |
-| **Linux Mint**        | 20+ / 21+ / 22+          | mengikuti Ubuntu | ✅ Tested |
-| **Pop!_OS**           | 22.04+                   | mengikuti Ubuntu | ✅ Tested |
-| **Elementary OS**     | 7+                       | mengikuti Ubuntu | ✅ |
-| **Kali Linux**        | 2024.x+                  | 3.11+ | ⚠️ Untuk audit lab only |
-| **Raspberry Pi OS**   | Bookworm (arm64)          | 3.11+ | ✅ Untuk monitoring perangkat IoT |
+**Konsep dasar**: 1 **Controller** (yang dikasih domain publik), banyak **Agent** (tetap private).
 
-**Yang TIDAK didukung** (perlu manual install): Fedora, RHEL/CentOS, openSUSE, Arch (karena pakai package manager yang berbeda — bisa di-port nanti kalau perlu).
+---
 
-### Apa yang sudah di-fix untuk Ubuntu 24.04+
+# ⚡ Quick Reference (kalau cuma butuh command)
 
-| Issue | Solusi |
+| Tugas | Command |
 |---|---|
-| **PEP 668** (`externally-managed-environment` error) | Installer pakai `venv` terpisah — tidak install ke system Python |
-| **`bcrypt` 4.1+ warning di passlib** | Auto-suppress di `auth.py` (functional, hanya log noise) |
-| **`certbot` apt-package hilang di Ubuntu 24+** | Installer auto-deteksi & instruksikan `snap install certbot` di Ubuntu 24+ |
-| **Node.js 18 sudah deprecated** | Installer pakai Node 20 LTS via NodeSource |
-| **Version pin terlalu strict** | Semua dependency pakai range (`>=X,<Y`) supaya kompatibel di semua versi Python 3.10–3.13 |
+| Install Controller | `git clone https://github.com/suryaex/secureops.git && cd secureops && sudo SERVER_NAME=secureops.site bash controller/deploy/deploy-prod.sh` |
+| Tambah Agent | Browser → Servers → **+ Add Server** → isi nama → copy command yang muncul → paste di server target ✅ |
+| Update | `cd ~/secureops && git pull && sudo bash controller/deploy/deploy-prod.sh` |
+| Log Controller | `sudo journalctl -u secureops-backend -f` |
+| Log Agent | `sudo journalctl -u secureops-agent -f` |
 
 ---
 
-## 📋 Rencana Deployment
+# 🟦 TAHAP 1 — Install Controller (1 server, 1 command)
 
-```
-TAHAP 1  →  Testing di VM lokal           →  4 VM: 1 controller + 3 agent
-                                              Akses lewat IP LAN (192.168.x.x)
-                                              Tanpa HTTPS, no domain
+## 1.1 Siapkan Server
 
-TAHAP 2  →  Production di server asli     →  Domain secureops.site
-                                              HTTPS auto via Cloudflare/Let's Encrypt
-                                              Cloudflare Tunnel (gratis, no port forward)
-```
+Server controller perlu:
+- **Ubuntu Server 22.04 / 24.04** (recommended) atau Debian 12+
+- **RAM 2 GB** minimum
+- **Disk 20 GB**
+- **Akses SSH root**
 
-**Yang kamu butuhkan dari sekarang:**
+Bisa pakai VPS (DigitalOcean, Vultr, Niagahoster, Hetzner) atau server fisik kampus.
 
-- ✅ Domain `secureops.site` (sudah punya)
-- ⬜ Software virtualisasi: **VirtualBox** (gratis) atau VMware Workstation
-- ⬜ ISO Ubuntu Server 22.04 LTS — download dari https://ubuntu.com/download/server (~2 GB)
-- ⬜ Komputer dengan minimal **16 GB RAM** (4 VM × 2 GB + sistem)
-- ⬜ Server produksi (VPS atau fisik) dengan Ubuntu 22.04+
-- ⬜ Akun gratis: Tailscale + Cloudflare
-
----
-
-# 🟦 TAHAP 1 — Testing di Virtual Machine
-
-> Tujuan: pastikan semua fitur jalan sebelum sentuh server produksi. Kalau ada error, masih bisa hapus VM dan ulang.
-
-## Langkah 1.1 — Buat 4 VM di VirtualBox
-
-Untuk setiap VM, gunakan settingan ini:
-
-| Item | Nilai |
-|---|---|
-| **OS** | Ubuntu Server 22.04 LTS |
-| **RAM** | 2048 MB (2 GB) |
-| **CPU** | 2 cores |
-| **Disk** | 20 GB (dynamic) |
-| **Network adapter 1** | Bridged Adapter (supaya VM dapat IP di jaringan kamu) |
-
-Beri nama VM-nya:
-
-| Nama VM | Peran | Hostname |
-|---|---|---|
-| `secureops-ctrl` | Controller (web UI + central API) | `controller` |
-| `secureops-web` | Agent (simulasi web server) | `web-prod` |
-| `secureops-db`  | Agent (simulasi database server) | `db-server` |
-| `secureops-bak` | Agent (simulasi backup server) | `backup-srv` |
-
-**Catatan saat install Ubuntu Server:**
-
-1. Saat ditanya hostname → isi sesuai tabel di atas
-2. Saat ditanya username → buat user `superadmin` dengan password yang kamu ingat
-3. Centang **"Install OpenSSH server"** supaya bisa SSH dari laptop
-4. Skip semua featured snaps, langsung **Done**
-
-Setelah ke-4 VM selesai install, **catat IP address-nya**:
+## 1.2 SSH ke server, install
 
 ```bash
-# Di setiap VM, jalankan:
-ip a | grep "inet "
-# Catat IP yang formatnya 192.168.x.x atau 10.x.x.x
-```
-
-Misal hasilnya:
-
-```
-controller   → 192.168.1.100
-web-prod     → 192.168.1.101
-db-server    → 192.168.1.102
-backup-srv   → 192.168.1.103
-```
-
-> Dari laptop, test SSH: `ssh superadmin@192.168.1.100` — kalau bisa masuk, lanjut.
-
----
-
-## Langkah 1.2 — Install Tailscale di semua VM
-
-Tailscale bikin "private VPN gratis" antar semua VM, supaya controller bisa hubungin agent walaupun nanti agent ada di server beda lokasi.
-
-**Buat akun Tailscale dulu** di https://login.tailscale.com (gratis, sign-up pakai Google/GitHub).
-
-Di **setiap** VM (4-4nya), jalankan:
-
-```bash
-# SSH ke VM dari laptop
-ssh superadmin@<ip-vm>
-
-# Install Tailscale
-curl -fsSL https://tailscale.com/install.sh | sudo sh
-
-# Authenticate — akan tampil URL, copy ke browser, login, approve device
-sudo tailscale up
-
-# Lihat IP Tailscale (formatnya 100.x.x.x)
-tailscale ip -4
-```
-
-Misal hasilnya:
-
-```
-controller   → Tailscale IP: 100.64.10.5
-web-prod     → Tailscale IP: 100.64.10.12
-db-server    → Tailscale IP: 100.64.10.18
-backup-srv   → Tailscale IP: 100.64.10.24
-```
-
-Test antar VM:
-
-```bash
-# Dari controller VM
-ping -c 2 100.64.10.12   # ping ke web-prod via Tailscale
-```
-
-Kalau berhasil ping, mesh sudah jalan ✅
-
----
-
-## Langkah 1.3 — Install Controller di VM `controller`
-
-```bash
-# Dari laptop, SSH ke controller VM
-ssh superadmin@192.168.1.100
-
-# Update sistem + install git
+# Update sistem
 sudo apt update && sudo apt upgrade -y
 sudo apt install -y git
 
-# Clone repository SecureOps
-cd ~
-git clone https://github.com/suryaex/secureops.git
-cd secureops
-
-# Jalankan installer — sekitar 3-5 menit
-sudo bash controller/deploy/deploy-prod.sh
-```
-
-Output terakhir kira-kira:
-
-```
-✅ Production deploy complete
-  Web:        http://192.168.1.100/
-  Backend:    http://192.168.1.100/api/health
-  Login with your real Linux account.
-```
-
-**Tes dari laptop:**
-
-1. Buka browser di laptop
-2. Akses `http://192.168.1.100`
-3. Login dengan username **superadmin** dan password Linux yang kamu set tadi
-4. Harusnya masuk ke dashboard SecureOps ✅
-
-> Kalau dapat error PAM, restart service: `sudo systemctl restart secureops-backend`. Pastikan service jalan **as root** (`sudo systemctl status secureops-backend`).
-
----
-
-## Langkah 1.4 — Daftarkan agent pertama (`web-prod`)
-
-> 🆕 **Flow baru (v1.5+):** Agent generate API key sendiri saat install. Kamu **tinggal copy-paste** ke Controller UI — tidak perlu bolak-balik antara browser dan terminal.
-
-### Step 1.4.1 — Install agent di VM `web-prod` DULU
-
-```bash
-# SSH ke web-prod
-ssh superadmin@192.168.1.101
-
-# Buat user terbatas untuk shell session (best practice — biar gak run as root)
-sudo useradd -m -s /bin/bash secureops
-
-# Install agent — TANPA API key, biar di-generate otomatis
-sudo SECUREOPS_SHELL_USER=secureops \
-     SECUREOPS_RECORD_SESSIONS=1 \
-     bash <(curl -fsSL https://raw.githubusercontent.com/suryaex/secureops/main/agent/deploy/install.sh)
-```
-
-Tunggu beberapa menit. **Output terakhir** akan tampil seperti ini:
-
-```
-╔══════════════════════════════════════════════════════════════╗
-║       ✅ SecureOps Agent Installed Successfully              ║
-╚══════════════════════════════════════════════════════════════╝
-
-  Distro:       Ubuntu 24.04.1 LTS
-  Hostname:     web-prod
-  Shell user:   secureops (drop-privileges enabled)
-  Recording:    ON  (/var/log/secureops/sessions)
-
-┌──────────────────────────────────────────────────────────────┐
-│       📋 PASTE THESE TO THE CONTROLLER UI                    │
-│       (Sidebar → Servers → Add Server)                       │
-└──────────────────────────────────────────────────────────────┘
-
-  Name     :  web-prod
-  API URL  :  http://100.64.10.12:8001
-  API Key  :  v8K3mNpQ7xT2wY9zR4sH6jL5dF1cB0aXuG8eI3yV2nM
-
-  ⚠  This key was auto-generated. Copy it now —
-     you can also find it later at:  /etc/secureops-agent/key
-```
-
-**Copy 3 informasi ini**:
-- `Name` (web-prod)
-- `API URL` (http://100.64.10.12:8001)
-- `API Key` (v8K3mNpQ...)
-
-> 💡 Lupa copy API Key? Ambil ulang: `sudo cat /etc/secureops-agent/key`
-
-### Step 1.4.2 — Daftarkan di Controller UI
-
-**Di browser** (controller UI):
-
-1. Sidebar **Servers** → tombol **+ Add Server**
-2. Modal terbuka dengan instruksi instalasi di atas (skip karena sudah di-install)
-3. Paste informasi yang sudah di-copy:
-
-   | Field | Value |
-   |---|---|
-   | **Server name** | `web-prod` |
-   | **Hostname** | `web-prod` (auto-fill) |
-   | **API URL** | `http://100.64.10.12:8001` |
-   | **API Key** | `v8K3mNpQ7xT2wY9zR4sH6jL5dF1cB0aXuG8eI3yV2nM` |
-   | **Tags** | `production, web` |
-
-   > 📌 Bisa klik icon 📋 di field API Key untuk auto-paste dari clipboard.
-
-4. Klik **Register & Connect** → otomatis ping → 🟢 **online**
-
-✅ Server pertama tersambung — total ~3 menit.
-
----
-
-## Langkah 1.5 — Daftarkan agent ke-2 dan ke-3
-
-Ulangi **Langkah 1.4** untuk `db-server` dan `backup-srv`:
-
-| Server | Tailscale IP | Tags |
-|---|---|---|
-| `db-server` | misal `100.64.10.18` | `production, database` |
-| `backup-srv` | misal `100.64.10.24` | `backup` |
-
-Setelah semua terdaftar, halaman **Servers** akan menampilkan 4 baris (1 controller local + 3 agent remote), semua hijau 🟢.
-
----
-
-## Langkah 1.6 — Test semua fitur
-
-### A. Dashboard & Fleet
-
-- Sidebar **Dashboard** → harus muncul stat cards + charts
-- Sidebar **Fleet** → harus muncul 4 card server dengan CPU/Memory/Disk per server (auto-refresh 10 detik)
-
-### B. Switch server di top-bar
-
-- Top-bar dropdown → pilih `db-server`
-- Sidebar **System Health** → grafik CPU/Memory di-pull dari `db-server`, bukan controller
-- Sidebar **Network** → daftar interface jaringan `db-server`
-
-### C. Permission Audit
-
-- Top-bar pilih `web-prod`
-- Sidebar **Audit** → klik **Start Scan** → tunggu beberapa detik → muncul daftar issue
-- Coba filter by severity (Critical / High / Medium / Low)
-
-### D. Sudo Monitor
-
-- Sidebar **Sudo** → klik **Scan Sudoers** → muncul daftar user dengan grup sudo/wheel
-
-### E. File Integrity
-
-- Sidebar **Integrity** → klik **Add File** → masukkan path `/etc/passwd` → Save
-- Klik **Scan Now** → file muncul dengan status `safe` + SHA-256 hash
-- SSH ke web-prod, edit `/etc/passwd` (atau bikin user baru) → re-scan dari UI → statusnya berubah jadi `modified` ⚠️
-
-### F. Live SSH Terminal 🖥️
-
-- Top-bar pilih `web-prod`
-- Sidebar **Terminal** → otomatis connect
-- Coba: `whoami` → output harusnya **`secureops`** (bukan root, karena `SECUREOPS_SHELL_USER=secureops`)
-- Coba: `ls -la`, `top` (q untuk keluar), `htop`, `vim test.txt`
-- Test tombol virtual keys: ^C untuk batal, Tab untuk completion, panah atas untuk history
-- Klik **Disconnect**
-
-### G. Session Replay 🎬
-
-- Sidebar **Replays** → muncul recording sesi yang barusan
-- Klik recording → terminal di-replay otomatis dengan timing asli
-- Coba ganti kecepatan ke 4× atau 8×
-- Klik download → dapat file `.cast` yang bisa juga dimainkan di terminal dengan `asciinema play file.cast`
-
-### H. Activity Logs
-
-- Sidebar **Logs** → harus muncul daftar semua action: Login, scan, Terminal Open/Close dengan durasi
-
-### I. User Management
-
-- Sidebar **Users** → klik **Add New User** → buat user DB (misalnya `auditor1` / password `Test@1234` / role `auditor`)
-- Logout, login ulang dengan `auditor1` → menu Users, Servers, Terminal harus **tidak muncul** di sidebar
-- Logout, login balik dengan superadmin
-
-### J. Download Report
-
-- Dashboard → klik **Download Report** → dapat file HTML
-- Buka file → muncul laporan lengkap audit
-- Tekan Ctrl+P di browser → **Save as PDF**
-
-### K. PWA install (opsional)
-
-- Buka `http://192.168.1.100` dari browser HP yang **satu jaringan** dengan VM
-- Chrome menu → **Install app** → icon SecureOps muncul di home screen
-- Buka — jalan full-screen seperti app native
-
----
-
-## ✅ Tahap 1 selesai
-
-Kalau semua di atas jalan, kamu siap pindah ke produksi. Kalau ada yang gagal, debug pakai:
-
-```bash
-# Di controller VM
-sudo journalctl -u secureops-backend -f      # log backend
-sudo journalctl -u nginx -f                  # log nginx
-sudo systemctl status secureops-backend
-
-# Di agent VM
-sudo journalctl -u secureops-agent -f
-sudo systemctl status secureops-agent
-```
-
----
-
-# 🟩 TAHAP 2 — Production dengan Domain `secureops.site`
-
-Sekarang asumsinya kamu sudah punya **VPS / server fisik** untuk deploy permanen.
-
-## Langkah 2.1 — Persiapan domain di Rumahweb
-
-Domain `secureops.site` dari Rumahweb perlu di-point ke server kamu. Ada **2 pilihan**:
-
-### 🅰️ Pilihan A — Pakai Cloudflare (RECOMMENDED, gratis HTTPS, no port forward)
-
-Cocok kalau:
-
-- Server kamu di rumah / kantor tanpa IP publik statis
-- ISP block port 80/443 (banyak ISP Indonesia begini)
-- Mau HTTPS otomatis
-
-**Langkah-langkah:**
-
-1. **Bikin akun Cloudflare gratis** di https://dash.cloudflare.com/sign-up
-
-2. Di Cloudflare dashboard → **Add a Site** → masukkan `secureops.site` → pilih plan **Free**
-
-3. Cloudflare kasih **2 nameserver**, misalnya:
-   ```
-   alex.ns.cloudflare.com
-   barb.ns.cloudflare.com
-   ```
-
-4. **Login ke client area Rumahweb** (https://clientarea.rumahweb.com)
-   - Klik **My Domains** → cari `secureops.site` → klik **Manage**
-   - Cari menu **Nameservers**
-   - Pilih **"Use custom nameservers"**
-   - Ganti dengan 2 nameserver Cloudflare di atas
-   - Save
-
-5. Tunggu **15 menit – 24 jam** sampai propagasi DNS selesai. Cek di:
-   ```bash
-   dig +short NS secureops.site
-   # Output harus tampilkan alex.ns.cloudflare.com dan barb.ns.cloudflare.com
-   ```
-
-6. Di Cloudflare dashboard → status domain berubah jadi 🟢 **Active**
-
-### 🅱️ Pilihan B — Pakai DNS Rumahweb langsung (kalau VPS punya IP publik statis)
-
-Cocok kalau:
-
-- Server kamu VPS dengan IP publik dedicated
-- Port 80/443 bisa dibuka di firewall VPS
-- Gak mau ribet pindah nameserver
-
-**Langkah-langkah:**
-
-1. Login Rumahweb client area → **Manage** domain `secureops.site`
-2. Cari menu **DNS Management** atau **Zone Editor**
-3. Tambah record:
-   ```
-   Type:  A
-   Name:  @
-   Value: <IP publik VPS kamu>
-   TTL:   300
-   ```
-4. Tambah lagi:
-   ```
-   Type:  A
-   Name:  www
-   Value: <IP publik VPS kamu>
-   TTL:   300
-   ```
-5. Save. Tunggu 5-30 menit propagasi.
-
-> 💡 **Rekomendasi: Pilihan A** karena gratis HTTPS + bisa diakses meski di belakang NAT.
-
----
-
-## Langkah 2.2 — Install Controller di server produksi
-
-```bash
-# SSH ke server produksi
-ssh user@<ip-server-produksi>
-
-# Update + install git
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y git
-
-# Clone & install
+# Clone & install (~5 menit)
 cd ~
 git clone https://github.com/suryaex/secureops.git
 cd secureops
 sudo SERVER_NAME=secureops.site bash controller/deploy/deploy-prod.sh
 ```
 
-Tunggu ~5 menit sampai selesai.
+Output akhir kira-kira:
+
+```
+═════════════════════════════════════════════════════════
+  ✅ Production deploy complete
+
+  Distro:    Ubuntu 24.04.1 LTS
+  Web:       http://10.5.5.10/
+  Domain:    http://secureops.site/    ← tinggal HTTPS
+  Backend:   http://10.5.5.10/api/health
+═════════════════════════════════════════════════════════
+```
+
+## 1.3 Test Login
+
+Buka browser → `http://<ip-server-kamu>/` → login pakai akun Linux server (yang punya group `sudo`).
+
+```
+┌───────────────────────────────────────┐
+│                                       │
+│         🛡 SecureOps                  │
+│  State Polytechnic of Sriwijaya       │
+│                                       │
+│  👤 Username   [_____________]         │
+│  🔑 Password   [_____________]         │
+│                                       │
+│         ┌──────────────┐              │
+│         │   Sign In →  │              │
+│         └──────────────┘              │
+│                                       │
+│  Authenticated via Linux PAM          │
+└───────────────────────────────────────┘
+```
+
+> 💡 Login pakai **user Linux server**, bukan user database. Anggota group `sudo` otomatis dapat role admin.
 
 ---
 
-## Langkah 2.3 — Setup HTTPS
+# 🟩 TAHAP 2 — Hubungkan Domain `secureops.site`
 
-### Kalau pakai Pilihan A (Cloudflare Tunnel):
+Saya rekomendasi pakai **Cloudflare Tunnel** karena:
+- ✅ Gratis HTTPS
+- ✅ Gak perlu IP publik / port forwarding
+- ✅ Tahan ISP block port 80/443
+
+## 2.1 Daftar Cloudflare
+
+1. Buka https://dash.cloudflare.com/sign-up
+2. Sign-up dengan email kamu
+3. Klik **"Add a Site"** → masukkan `secureops.site` → pilih plan **Free**
+4. Cloudflare kasih **2 nameserver**, contoh:
+   ```
+   alex.ns.cloudflare.com
+   barb.ns.cloudflare.com
+   ```
+   📸 **Screenshot/catat nameserver ini**
+
+## 2.2 Ganti Nameserver di Rumahweb
+
+1. Login https://clientarea.rumahweb.com
+2. **Domains** → **My Domains** → klik **Manage** untuk `secureops.site`
+3. Cari tab **"Nameservers"**
+4. Pilih **"Use custom nameservers"**
+5. Paste 2 nameserver dari Cloudflare → **Save**
+
+```
+┌─────────────────────────────────────────────────┐
+│  Rumahweb Client Area                            │
+│  ─────────────────────────────────────────       │
+│                                                  │
+│   Domain: secureops.site                         │
+│                                                  │
+│   ○ Use Rumahweb nameservers                     │
+│   ● Use custom nameservers       ← PILIH INI    │
+│                                                  │
+│   Nameserver 1: [alex.ns.cloudflare.com_______] │
+│   Nameserver 2: [barb.ns.cloudflare.com_______] │
+│   Nameserver 3: [______________________________] │
+│   Nameserver 4: [______________________________] │
+│                                                  │
+│                        ┌──────────────────────┐ │
+│                        │  Change Nameservers  │ │
+│                        └──────────────────────┘ │
+└─────────────────────────────────────────────────┘
+```
+
+⏰ **Tunggu 15-30 menit** sampai propagasi. Cek di https://dnschecker.org/#NS/secureops.site
+
+Kalau sudah hijau di Cloudflare dashboard (status "Active"), lanjut.
+
+## 2.3 Install Cloudflared di Server Controller
 
 ```bash
-# Install cloudflared
+# SSH ke server controller
+ssh user@<ip-controller>
+
+# Install
 curl -L --output cloudflared.deb \
   https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
 sudo dpkg -i cloudflared.deb
 
-# Authenticate — browser kebuka, pilih secureops.site, Authorize
+# Auth ke Cloudflare (browser akan kebuka)
 cloudflared tunnel login
 
 # Buat tunnel
 cloudflared tunnel create secureops
-# COPY UUID YANG MUNCUL, misalnya: 7a3b9c1d-8e6f-4a2b-9c5d-1e3f7a8b9c0d
+# OUTPUT: Created tunnel secureops with id <UUID>
+# CATAT UUID INI! Contoh: 7a3b9c1d-8e6f-4a2b-9c5d-1e3f7a8b9c0d
+```
 
-# Setup config
+## 2.4 Setup Tunnel
+
+```bash
+# Copy credentials ke tempat permanent
 sudo mkdir -p /etc/cloudflared
 sudo cp ~/.cloudflared/*.json /etc/cloudflared/
+
+# Copy template config
 sudo cp ~/secureops/controller/deploy/cloudflared-config.yml /etc/cloudflared/config.yml
 
-# Edit config — ganti UUID dan domain
+# Edit config
 sudo nano /etc/cloudflared/config.yml
 ```
 
-Isi `config.yml`:
+Edit jadi (ganti `<UUID>` dengan UUID yang kamu catat tadi):
 
 ```yaml
-tunnel: 7a3b9c1d-8e6f-4a2b-9c5d-1e3f7a8b9c0d   # ← ganti dengan UUID kamu
+tunnel: 7a3b9c1d-8e6f-4a2b-9c5d-1e3f7a8b9c0d
 credentials-file: /etc/cloudflared/7a3b9c1d-8e6f-4a2b-9c5d-1e3f7a8b9c0d.json
 
 ingress:
@@ -503,13 +219,13 @@ ingress:
   - service: http_status:404
 ```
 
-Save (Ctrl+O, Enter, Ctrl+X), lalu:
+Save (Ctrl+O, Enter, Ctrl+X).
 
 ```bash
-# Routing DNS Cloudflare otomatis ke tunnel
+# Route DNS ke tunnel
 cloudflared tunnel route dns secureops secureops.site
 
-# Buat service user
+# Bikin user service
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin cloudflared
 sudo chown -R cloudflared:cloudflared /etc/cloudflared
 
@@ -520,267 +236,334 @@ sudo systemctl enable --now secureops-cloudflared
 sudo systemctl status secureops-cloudflared
 ```
 
-**Test**: buka browser → `https://secureops.site` → harus muncul SecureOps dengan gembok HTTPS 🔒
+## 2.5 Test!
 
-### Kalau pakai Pilihan B (Let's Encrypt):
+Buka di browser: **https://secureops.site**
 
-```bash
-# Pastikan DNS sudah propagate
-dig +short A secureops.site
-# Output harus IP server kamu
-
-# Install certbot
-sudo apt install -y certbot python3-certbot-nginx
-
-# Issue SSL certificate
-sudo certbot --nginx -d secureops.site -d www.secureops.site
-# Saat ditanya:
-#   Email: <email kamu>
-#   Agree to TOS: y
-#   Share email with EFF: n (terserah)
-#   Redirect HTTP to HTTPS: 2 (pilih 2 untuk auto-redirect)
+```
+┌─────────────────────────────────────────────────┐
+│  🔒 secureops.site                              │
+│  ─────────────────────────────────────────      │
+│                                                  │
+│         🛡 SecureOps                            │
+│   State Polytechnic of Sriwijaya                 │
+│                                                  │
+│  ✅ Halaman login muncul dengan HTTPS hijau     │
+│                                                  │
+└─────────────────────────────────────────────────┘
 ```
 
-**Test**: `https://secureops.site` — harus jalan dengan HTTPS 🔒
-
-Sertifikat auto-renew tiap 60 hari (systemd timer `certbot.timer`).
+🎉 Domain LIVE di internet dengan HTTPS gratis!
 
 ---
 
-## Langkah 2.4 — Update CORS untuk domain produksi
+# 🟨 TAHAP 3 — Tambah Server Agent (yang HARUS dimonitor)
 
-```bash
-sudo nano /etc/systemd/system/secureops-backend.service
+> **Ini fitur favorit di v1.5** — cuma 1 command, otomatis register.
+
+## 3.1 Klik "+ Add Server" di UI
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  🛡 SecureOps                          controller ▼       │
+├──────┬─────────────────────────────────────────────────────┤
+│      │                                                      │
+│ 📊 Dashboard          Monitored Servers                     │
+│ 🌐 Fleet              Fleet of agents...                    │
+│ 🔍 Audit                                                    │
+│ 🔐 Sudo                                ┌─────────────────┐  │
+│ ✅ Integrity                            │ + Add Server   │  │
+│ 📝 Logs                                └────────┬────────┘  │
+│ 🖥  Terminal                                    │ KLIK!     │
+│ 📡 Servers ◀──── KAMU DISINI                   │           │
+│ 👥 Users                                                    │
+└────────────────────────────────────────────────────────────┘
 ```
 
-Ubah baris CORS jadi:
+## 3.2 Pilih Mode "One-Liner" → Isi Nama
 
-```ini
-Environment="SECUREOPS_CORS_ORIGINS=https://secureops.site,capacitor://localhost"
+```
+┌──────────────────────────────────────────────────────────────┐
+│  ⚡ Add a new server                                       ✕ │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  ┌──────────────────────────┐  ┌──────────────────────────┐  │
+│  │ ⚡ One-Liner             │  │  ✏ Manual Entry          │  │
+│  │ (Recommended) ◀━━━ PILIH │  │                          │  │
+│  └──────────────────────────┘  └──────────────────────────┘  │
+│                                                               │
+│  ⚡ How it works                                              │
+│   1. Pick a name for your new server                          │
+│   2. Copy the one-liner command (next screen)                 │
+│   3. Paste it on the target server's terminal                 │
+│   4. Server appears here automatically                        │
+│                                                               │
+│  SERVER NAME *                                                │
+│  ┌─────────────────────────────────────────────────────────┐│
+│  │  web-prod-01                                              ││
+│  └─────────────────────────────────────────────────────────┘│
+│                                                               │
+│  TAGS (optional)                                              │
+│  ┌─────────────────────────────────────────────────────────┐│
+│  │  production, web                                          ││
+│  └─────────────────────────────────────────────────────────┘│
+│                                                               │
+│  ┌─────────────────────────┐    ┌─────────────┐              │
+│  │ → Generate install cmd  │    │   Cancel    │              │
+│  └─────────────────────────┘    └─────────────┘              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-Save, lalu:
+Isi nama (misal `web-prod-01`), klik **"Generate install command"**.
+
+## 3.3 Copy 1 Command yang Muncul
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  ⚡ Add a new server                                       ✕ │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  💻 Run this on the new server  web-prod-01                  │
+│                                                               │
+│  ╭──────────────────────────────────────────────────╮ ┌────┐│
+│  │ curl -fsSL "https://secureops.site/api/servers/..│ │ 📋 ││
+│  │ install-script/Xy7Bz..." | sudo bash             │ │COPY││
+│  ╰──────────────────────────────────────────────────╯ └────┘│
+│                                                               │
+│  Token expires in 59:42                                       │
+│                                                               │
+│  ┌──────────────────────────────────────────────────┐         │
+│  │            ⏳ (spinning loader)                   │         │
+│  │     Waiting for the agent to register...         │         │
+│  └──────────────────────────────────────────────────┘         │
+│                                                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Klik icon **📋** di pojok kanan → command tercopy.
+
+**Biarkan window ini tetap terbuka** — dia akan otomatis update saat agent join.
+
+## 3.4 Paste di Server Target
+
+SSH ke server yang mau dimonitor, paste command:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl restart secureops-backend
+# Di server target
+curl -fsSL "https://secureops.site/api/servers/install-script/Xy7Bz..." | sudo bash
+```
+
+Output di terminal:
+
+```
+==> Downloading main installer...
+==> Detected: Ubuntu 24.04.1 LTS
+==> Installing system packages…
+==> Setting up Python venv…
+==> Auto-registering with controller at https://secureops.site
+
+╔══════════════════════════════════════════════════════════╗
+║       ✅ SecureOps Agent Installed Successfully           ║
+╚══════════════════════════════════════════════════════════╝
+
+┌──────────────────────────────────────────────────────────┐
+│       🎉 AUTO-REGISTERED WITH CONTROLLER                 │
+│       No further action needed — agent is online!        │
+└──────────────────────────────────────────────────────────┘
+```
+
+⏱️ Tunggu 2-5 menit. Setelah muncul **"🎉 AUTO-REGISTERED"**, balik ke browser.
+
+## 3.5 Browser Otomatis Update
+
+Window modal di browser otomatis berubah (tanpa refresh):
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                                                              │
+│                       ┌──────────────┐                       │
+│                       │      ✅      │                       │
+│                       └──────────────┘                       │
+│                                                              │
+│                  Server connected!                           │
+│           web-prod-01 is now in your fleet.                  │
+│                                                              │
+│        ┌─────────────┐    ┌─────────────────┐                │
+│        │ ✓  Got it    │    │ +  Add another  │                │
+│        └─────────────┘    └─────────────────┘                │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Klik **"Got it"** atau **"Add another"** untuk lanjut tambah server lain.
+
+## 3.6 Cek Hasil
+
+Pindah ke top-bar selector → pilih `web-prod-01`:
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  🛡 SecureOps    🔍 search...   ● web-prod-01 ▼  System Health │
+├──────┬─────────────────────────────────────────────────────────┤
+│ 📊 Dashboard          System Health — web-prod-01               │
+│ 🌐 Fleet                                                        │
+│ 🔍 Audit         CPU      Memory     Disk      Network          │
+│                ┌─────┐  ┌─────┐   ┌─────┐   ┌─────┐            │
+│                │ 12% │  │ 38% │   │ 24% │   │ ↑↓  │            │
+│                └─────┘  └─────┘   └─────┘   └─────┘            │
+│                                                                  │
+│                  [grafik CPU usage 24 jam terakhir]              │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+🎉 **Selesai!** Server `web-prod-01` sekarang dimonitor.
+
+**Ulangi 3.1 - 3.6 untuk setiap server lain yang mau dimonitor.**
+
+---
+
+# 🟪 TAHAP 4 — Mobile App (Opsional)
+
+## 4.1 Install di Android
+
+1. Buka https://secureops.site di **Chrome** Android
+2. Menu (titik 3) → **"Install app"** atau **"Add to Home Screen"**
+3. Icon SecureOps muncul di home screen
+4. Buka → jalan **full screen** seperti app native
+
+## 4.2 Install di iPhone
+
+1. Buka https://secureops.site di **Safari** (HARUS Safari, bukan Chrome)
+2. Tombol Share → **"Add to Home Screen"**
+3. Done!
+
+```
+┌────────────────────────┐
+│ 📱 iPhone Home Screen   │
+├────────────────────────┤
+│                        │
+│ 📷  ⛅  💬  📰         │
+│                        │
+│ 🛡  📅  ✉  📷         │
+│ ↑                      │
+│ SecureOps              │
+│                        │
+└────────────────────────┘
 ```
 
 ---
 
-## Langkah 2.5 — Install agent di setiap server produksi
+# 🛠️ Day-2 Operations
 
-Flow agent registration **agent-first** (key di-generate di sisi agent):
-
-**1. Di server target** — install lebih dulu:
+## Update ke versi terbaru
 
 ```bash
-# Install Tailscale (kalau server di lokasi berbeda dari controller)
-curl -fsSL https://tailscale.com/install.sh | sudo sh
-sudo tailscale up
-
-# Buat user shell terbatas
-sudo useradd -m -s /bin/bash secureops
-
-# Install agent — TANPA API key, akan di-generate otomatis
-sudo SECUREOPS_SHELL_USER=secureops \
-     SECUREOPS_RECORD_SESSIONS=1 \
-     bash <(curl -fsSL https://raw.githubusercontent.com/suryaex/secureops/main/agent/deploy/install.sh)
-```
-
-Di output terakhir, copy **3 informasi**:
-- `Name` (default = hostname server)
-- `API URL` (otomatis pakai Tailscale IP kalau ada, atau LAN IP)
-- `API Key` (auto-generated 43 karakter)
-
-**2. Di browser** — buka `https://secureops.site` sebagai admin:
-
-- Sidebar **Servers** → **+ Add Server**
-- Paste 3 informasi dari step 1 + tambah tags
-- Klik **Register & Connect** → otomatis ping → 🟢
-
-> 📌 Untuk batch install banyak server, jalankan installer di semua server dulu (paralel via SSH), lalu daftarkan satu-satu di UI. Setiap agent punya key unik sendiri.
-
----
-
-## Langkah 2.6 — Setup user akses untuk tim
-
-Login sebagai admin (kamu sendiri lewat akun Linux), lalu:
-
-**Untuk anggota tim yang butuh full access:**
-
-- Pastikan mereka sudah punya akun Linux di server **controller**:
-  ```bash
-  sudo useradd -m -s /bin/bash budi
-  sudo passwd budi
-  ```
-- Tambahkan ke group sudo: `sudo usermod -aG sudo budi`
-- Mereka login pakai username + password Linux mereka → otomatis admin role
-
-**Untuk auditor (read-only):**
-
-- Bisa buat user OS biasa tanpa grup sudo, ATAU
-- Sidebar **Users** → **Add New User** → role `auditor`
-
----
-
-# 🛠️ Day-2 Operations (Setelah Live)
-
-## Backup database
-
-Database SQLite ada di `/home/<user>/secureops/controller/backend/secureops.db`. Backup harian:
-
-```bash
-sudo crontab -e
-
-# Tambah baris ini (backup tiap jam 2 pagi):
-0 2 * * * cp /home/superadmin/secureops/controller/backend/secureops.db /var/backups/secureops-$(date +\%Y\%m\%d).db
-```
-
-## Cek log
-
-```bash
-# Backend
-sudo journalctl -u secureops-backend -f
-
-# Nginx
-sudo journalctl -u nginx -f
-sudo tail -f /var/log/nginx/secureops.access.log
-
-# Cloudflare Tunnel
-sudo journalctl -u secureops-cloudflared -f
-
-# Agent di server lain
-sudo journalctl -u secureops-agent -f
-```
-
-## Update versi baru
-
-Setiap kali ada update di GitHub:
-
-**Di controller:**
-
-```bash
+# Di controller
 cd ~/secureops
 git pull
 sudo bash controller/deploy/deploy-prod.sh
-```
 
-**Di setiap agent:**
-
-```bash
+# Di setiap agent (otomatis kalau pakai install ulang dari UI)
 sudo git -C /opt/secureops-agent pull
 sudo /opt/secureops-agent/agent/backend/venv/bin/pip install -r /opt/secureops-agent/agent/backend/requirements.txt
 sudo systemctl restart secureops-agent
 ```
 
-## Reset password user DB (bukan PAM)
+## Cek log
 
-Sidebar **Users** → klik icon 🔑 → masukkan password baru → Save.
+```bash
+# Controller
+sudo journalctl -u secureops-backend -f
+sudo journalctl -u nginx -f
+sudo journalctl -u secureops-cloudflared -f
 
-## Hapus agent dari fleet
+# Agent
+sudo journalctl -u secureops-agent -f
+```
 
-1. UI **Servers** → klik 🗑 → konfirmasi
-2. Di server agent:
-   ```bash
-   sudo systemctl disable --now secureops-agent
-   sudo rm -rf /opt/secureops-agent
-   ```
+## Backup database
+
+```bash
+# Backup harian otomatis pakai cron
+sudo crontab -e
+
+# Tambahkan baris ini:
+0 2 * * * cp /home/superadmin/secureops/controller/backend/secureops.db /var/backups/secureops-$(date +\%Y\%m\%d).db
+```
+
+## Hapus agent
+
+1. UI **Servers** → klik 🗑️ delete
+2. Di agent server: `sudo systemctl disable --now secureops-agent && sudo rm -rf /opt/secureops-agent`
+
+## Reset password user di UI
+
+Sidebar **Users** → klik icon 🔑 di row user → masukkan password baru → Save.
 
 ---
 
-# 🚨 Troubleshooting Cepat
+# 🚨 Troubleshooting
 
 | Gejala | Solusi |
 |---|---|
-| `502 Bad Gateway` di browser | `sudo systemctl restart secureops-backend nginx` |
-| `error: externally-managed-environment` saat pip | Installer udah pakai venv — pastikan jalanin `bash controller/deploy/deploy-prod.sh` bukan pip manual |
-| Ubuntu 24.04: `certbot` tidak ada di apt | Pakai snap: `sudo snap install --classic certbot && sudo ln -sf /snap/bin/certbot /usr/bin/certbot` |
-| Warning "trapped: error reading bcrypt version" | Sudah ditekan otomatis di v1.4+. Update repo: `git pull && bash controller/deploy/deploy-prod.sh` |
-| Login gagal: "Invalid Linux username or password" | Pastikan user-nya ada di controller server (`getent passwd <user>`). Backend harus run as root (cek `systemctl status` "User=root") |
-| Agent merah / offline | Cek `tailscale status` di kedua side. Test: `curl -H "X-Agent-Key: <key>" http://<tailscale-ip>:8001/api/health` |
-| Terminal disconnect setelah 100 detik (Cloudflare) | Free plan limit. Solusi: keep typing OR upgrade ke Pro OR pakai Let's Encrypt langsung |
-| Cloudflare error 1033 | Tunnel daemon mati: `sudo systemctl restart secureops-cloudflared` |
-| HTTPS error "certificate not valid" | Tunggu 5-10 menit setelah `certbot`. Pastikan DNS udah propagate (`dig secureops.site`) |
-| Sudoers kosong di Sudo Monitor | Agent harus run as root supaya bisa baca `/etc/sudoers`. Pastikan systemd unit `User=root` |
-| Recording kosong | Pastikan `SECUREOPS_RECORD_SESSIONS=1` di systemd agent. Cek folder ada: `ls /var/log/secureops/sessions/` |
+| **502 Bad Gateway** di browser | `sudo systemctl restart secureops-backend nginx` |
+| Login PAM gagal | Pastikan user di group `sudo` (`sudo usermod -aG sudo username`). Backend harus run as root. |
+| Agent stuck "waiting" lebih dari 5 menit | Cek terminal agent — pasti ada error. Atau klik **"Generate new token"** di modal. |
+| Cloudflare error 1033 | Tunnel mati: `sudo systemctl restart secureops-cloudflared` |
+| Cloudflare error 522 | Backend mati: `sudo systemctl restart secureops-backend` |
+| HTTPS belum aktif | Cek DNS sudah propagate: https://dnschecker.org/#NS/secureops.site |
+| Terminal WebSocket putus 100s di Cloudflare | Free plan limit. Pakai Pro plan ($20/bln) atau switch ke certbot direct |
+| Agent crash setelah install | `sudo journalctl -u secureops-agent -n 50` → kirim outputnya |
+| Ubuntu 24+: `externally-managed-environment` | Sudah ditangani — installer pakai venv terpisah |
 
 ---
 
-# ✅ Checklist Final Production
+# ✅ Checklist Final
 
-Setelah semua selesai, pastikan ini semua centang:
+Sebelum dianggap selesai, pastikan:
 
-- [ ] `https://secureops.site` bisa diakses dari internet
-- [ ] HTTPS aktif (gembok hijau di browser)
-- [ ] Login pakai akun Linux server controller berhasil
-- [ ] Semua agent server muncul 🟢 online di Servers
-- [ ] Top-bar selector bisa pindah-pindah server
-- [ ] Halaman Fleet menampilkan grid semua server dengan metrics live
-- [ ] Live Terminal jalan ke agent — output `whoami` adalah `secureops`, bukan `root`
-- [ ] Recording sesi muncul di Replays setelah disconnect
-- [ ] Activity Logs catat semua login + Terminal Open/Close
-- [ ] Download Report menghasilkan file HTML lengkap
+- [ ] https://secureops.site bisa diakses dengan HTTPS hijau
+- [ ] Login pakai akun Linux di server controller sukses
+- [ ] Klik **+ Add Server** → muncul modal dengan tab One-Liner
+- [ ] Generate command → bisa dicopy → paste di agent → auto-register sukses
+- [ ] Agent muncul 🟢 online di tabel Servers
+- [ ] Switch server di top-bar selector → semua page (Health, Network, Terminal, dll) menampilkan data agent
 - [ ] PWA bisa di-install di HP via "Add to Home Screen"
 - [ ] Cron backup database aktif (`sudo crontab -l`)
+- [ ] Log tidak ada error: `sudo journalctl -u secureops-backend -n 20`
 
-Kalau semua centang → **production ready** ✅
-
----
-
-# 📞 Catatan Tambahan
-
-## Domain belum ter-route?
-
-Cek DNS-nya:
-
-- Pilihan A (Cloudflare): https://dnschecker.org/#NS/secureops.site
-- Pilihan B (Rumahweb langsung): https://dnschecker.org/#A/secureops.site
-
-## Mau monitoring 10+ server sekaligus?
-
-Setiap server sekarang **generate API key-nya sendiri**, jadi tinggal jalankan installer paralel:
-
-```bash
-# Install ke banyak server sekaligus (paralel)
-for ip in 100.64.10.5 100.64.10.12 100.64.10.18 100.64.10.24; do
-  ssh root@$ip "SECUREOPS_SHELL_USER=secureops \
-                SECUREOPS_RECORD_SESSIONS=1 \
-                bash <(curl -fsSL https://raw.githubusercontent.com/suryaex/secureops/main/agent/deploy/install.sh)" \
-   2>&1 | tee install-$ip.log &
-done
-wait
-
-# Lalu ambil API key + URL dari log masing-masing:
-for ip in 100.64.10.5 100.64.10.12 100.64.10.18 100.64.10.24; do
-  echo "=== $ip ==="
-  grep -E "(API URL|API Key)" install-$ip.log
-done
-```
-
-Outputnya tinggal copy-paste ke Controller UI satu per satu. **Tiap server punya key unik** dan bisa di-rotate/revoke independen.
-
-## Mau push notif alert ke Telegram/Slack?
-
-Belum di-build di v1.4, tapi mudah ditambah di `controller/backend/routers/system.py` pada endpoint `system_alerts`. Kabari saya kalau perlu.
-
-## Mau backup ke storage eksternal?
-
-Gampang — pakai `rclone` dengan provider Google Drive / Backblaze / S3:
-
-```bash
-sudo apt install -y rclone
-rclone config   # ikuti wizard
-# Lalu di crontab:
-0 3 * * * rclone copy /var/backups/secureops-$(date +\%Y\%m\%d).db remote:secureops-backups/
-```
+Kalau semua centang → **production ready** 🚀
 
 ---
 
-**Selamat coba di VM dulu!** 🚀
+# 📚 Dokumentasi Tambahan
 
-Kalau ada step yang stuck atau error, copy-paste output error-nya — saya bantu debug.
+- **[PANDUAN-TAMBAH-SERVER.md](PANDUAN-TAMBAH-SERVER.md)** — detail visual nambah agent
+- **[INSTALL.md](INSTALL.md)** — versi English
+- **[controller/deploy/MOBILE.md](controller/deploy/MOBILE.md)** — bikin APK Android / IPA iOS (Capacitor)
+- **[controller/deploy/MULTI-SERVER.md](controller/deploy/MULTI-SERVER.md)** — arsitektur deep dive
 
 ---
 
-*Dokumen ini bagian dari project SecureOps v1.4 · State Polytechnic of Sriwijaya · Last updated: 2026-05-15*
+# 💡 Tips Pro
+
+1. **Naming convention agent**: gunakan pola seperti `<env>-<role>-<id>`, misal `prod-web-01`, `prod-db-01`, `dev-test-01`. Lebih mudah dicari di top-bar selector.
+
+2. **Tag-based filtering**: Tag bukan cuma metadata. Future feature akan support filter Dashboard berdasarkan tag (misal "Show only production servers").
+
+3. **Backup berlapis**: SQLite database controller di-backup harian + sertifikat Cloudflare disimpan terpisah:
+   ```bash
+   sudo rclone copy /var/backups/ remote:secureops-backups/
+   sudo rclone copy /etc/cloudflared/ remote:secureops-backups/cloudflared/
+   ```
+
+4. **Monitoring si monitor**: Install Uptime Robot (gratis) yang ping `https://secureops.site/api/health` tiap 5 menit. Notif via email/Telegram kalau down.
+
+5. **Limit akses publik**: Cloudflare Free punya fitur **Access Policies**. Bisa di-restrict supaya cuma email kampus `@polsri.ac.id` yang bisa buka login page (sebelum login PAM).
+
+---
+
+**Selesai!** Kalau ada error atau bingung di step manapun, paste output errornya ke chat. 🚀
+
+---
+
+*Dokumen ini adalah panduan resmi instalasi SecureOps v1.5 · State Polytechnic of Sriwijaya · 2026 · Bahasa Indonesia*
