@@ -224,6 +224,7 @@ async def ping_everyone(db: Session = Depends(get_db),
 class JoinTokenCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     tags: Optional[str] = ""
+    os:   Optional[str] = "linux"   # linux / windows / macos
 
 
 @router.post("/join-token")
@@ -245,9 +246,15 @@ def create_join_token(body: JoinTokenCreate, request: Request,
     token = secrets.token_urlsafe(24)
     expires_at = datetime.utcnow() + timedelta(hours=_JOIN_TOKEN_TTL_HOURS)
 
+    # Validate OS
+    target_os = (body.os or "linux").lower().strip()
+    if target_os not in ("linux", "windows", "macos"):
+        raise HTTPException(400, f"Invalid OS '{target_os}'. Use linux/windows/macos.")
+
     _JOIN_TOKENS[token] = {
         "name":       body.name,
         "tags":       (body.tags or "").strip(),
+        "os":         target_os,
         "expires_at": expires_at,
         "used":       False,
         "used_at":    None,
@@ -255,14 +262,25 @@ def create_join_token(body: JoinTokenCreate, request: Request,
         "created_by": current.username,
     }
 
-    # Build absolute public URL from request (Cloudflare / nginx already sets X-Forwarded-Proto)
+    # Build absolute public URL from request
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     host  = request.headers.get("x-forwarded-host",  request.headers.get("host", "localhost"))
     base  = f"{proto}://{host}"
 
-    one_liner = (
-        f'curl -fsSL "{base}/api/servers/install-script/{token}" | sudo bash'
-    )
+    # OS-specific one-liner
+    if target_os == "windows":
+        one_liner = (
+            f'iwr "{base}/api/servers/install-script/{token}?os=windows" '
+            f'-UseBasicParsing | iex'
+        )
+    elif target_os == "macos":
+        one_liner = (
+            f'curl -fsSL "{base}/api/servers/install-script/{token}?os=macos" | sudo bash'
+        )
+    else:  # linux
+        one_liner = (
+            f'curl -fsSL "{base}/api/servers/install-script/{token}" | sudo bash'
+        )
 
     db.add(models.AdminActivityLog(
         admin_id=getattr(current, "id", None),
@@ -278,6 +296,7 @@ def create_join_token(body: JoinTokenCreate, request: Request,
         "token":           token,
         "name":            body.name,
         "tags":            body.tags or "",
+        "os":              target_os,
         "expires_at":      expires_at.isoformat() + "Z",
         "ttl_seconds":     int((expires_at - datetime.utcnow()).total_seconds()),
         "install_command": one_liner,
@@ -316,8 +335,12 @@ def join_token_status(token: str, db: Session = Depends(get_db),
 
 
 @router.get("/install-script/{token}", response_class=PlainTextResponse)
-def get_install_script(token: str, request: Request):
-    """PUBLIC endpoint — agent downloads a personalized install bootstrap script."""
+def get_install_script(token: str, request: Request, os: Optional[str] = None):
+    """PUBLIC endpoint — agent downloads a personalized install bootstrap script.
+
+    Query param ?os= overrides the OS stored in the token (allows manual choice).
+    Supported values: linux (default), windows, macos
+    """
     tok = _JOIN_TOKENS.get(token)
     if not tok:
         raise HTTPException(404, "Invalid token")
@@ -326,13 +349,75 @@ def get_install_script(token: str, request: Request):
     if tok["expires_at"] < datetime.utcnow():
         raise HTTPException(410, "Token expired")
 
+    target_os = (os or tok.get("os") or "linux").lower()
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     host  = request.headers.get("x-forwarded-host",  request.headers.get("host", "localhost"))
     base  = f"{proto}://{host}"
 
-    # Self-contained bootstrap script. Runs as root via `| sudo bash`.
+    # ─── WINDOWS — PowerShell bootstrap ───
+    if target_os == "windows":
+        script = f"""# SecureOps Agent — Windows auto-registration bootstrap
+# Generated for: {tok['name']}
+# Expires:       {tok['expires_at'].isoformat()}Z
+
+$ErrorActionPreference = 'Stop'
+
+# Allow this script to run in current process
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+
+# Set environment variables for the main installer
+$env:SECUREOPS_CONTROLLER_URL = "{base}"
+$env:SECUREOPS_JOIN_TOKEN     = "{token}"
+$env:SECUREOPS_SERVER_NAME    = "{tok['name']}"
+$env:SECUREOPS_TAGS           = "{tok['tags']}"
+if (-not $env:SECUREOPS_RECORD_SESSIONS) {{
+    $env:SECUREOPS_RECORD_SESSIONS = "1"
+}}
+
+# Must be admin
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{
+    Write-Error "This installer must run as Administrator. Right-click PowerShell -> Run as Administrator."
+    exit 1
+}}
+
+# Download main installer
+Write-Host "==> Downloading main installer..." -ForegroundColor Green
+$installerUrl = "https://raw.githubusercontent.com/suryaex/secureops/main/agent-windows/deploy/install.ps1"
+$installer    = "$env:TEMP\\secureops-install.ps1"
+Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing
+
+# Run it — the installer will call back to {base}/api/servers/auto-register
+& $installer
+"""
+        return PlainTextResponse(content=script, media_type="text/x-powershell")
+
+    # ─── macOS — bash bootstrap dengan path ke agent-macos ───
+    if target_os == "macos":
+        script = f"""#!/usr/bin/env bash
+# SecureOps Agent — macOS auto-registration bootstrap
+# Generated for: {tok['name']}
+# Expires:       {tok['expires_at'].isoformat()}Z
+set -euo pipefail
+
+export SECUREOPS_CONTROLLER_URL="{base}"
+export SECUREOPS_JOIN_TOKEN="{token}"
+export SECUREOPS_SERVER_NAME="{tok['name']}"
+export SECUREOPS_TAGS="{tok['tags']}"
+export SECUREOPS_SHELL_USER="${{SECUREOPS_SHELL_USER:-_secureops}}"
+export SECUREOPS_RECORD_SESSIONS="${{SECUREOPS_RECORD_SESSIONS:-1}}"
+
+# Download main installer
+echo "==> Downloading main installer..."
+curl -fsSL https://raw.githubusercontent.com/suryaex/secureops/main/agent-macos/deploy/install.sh -o /tmp/secureops-install.sh
+
+# Run it
+bash /tmp/secureops-install.sh
+"""
+        return PlainTextResponse(content=script, media_type="text/x-shellscript")
+
+    # ─── LINUX (default) — bash bootstrap ───
     script = f"""#!/usr/bin/env bash
-# SecureOps Agent — auto-registration bootstrap
+# SecureOps Agent — Linux auto-registration bootstrap
 # Generated for: {tok['name']}
 # Expires:       {tok['expires_at'].isoformat()}Z
 set -euo pipefail
@@ -349,9 +434,9 @@ id "$SECUREOPS_SHELL_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$SECUREOP
 
 # Download main installer
 echo "==> Downloading main installer..."
-curl -fsSL https://raw.githubusercontent.com/suryaex/secureops/main/agent/deploy/install.sh -o /tmp/secureops-install.sh
+curl -fsSL https://raw.githubusercontent.com/suryaex/secureops/main/agent-linux/deploy/install.sh -o /tmp/secureops-install.sh
 
-# Run it — the installer will call back to {base}/api/servers/auto-register
+# Run it
 bash /tmp/secureops-install.sh
 """
 

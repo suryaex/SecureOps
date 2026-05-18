@@ -263,7 +263,7 @@ function QuickJoinFlow({ onClose, onSaved }) {
   //  'waiting'   = command generated, polling for agent to join
   //  'done'      = agent reported in — success
   const [step, setStep] = useState('form')
-  const [form, setForm] = useState({ name: '', tags: '' })
+  const [form, setForm] = useState({ name: '', tags: '', os: 'linux' })
   const [tokenData, setTokenData] = useState(null)   // { token, install_command, expires_at, ... }
   const [status, setStatus] = useState(null)         // poll status
   const [busy, setBusy] = useState(false)
@@ -279,6 +279,7 @@ function QuickJoinFlow({ onClose, onSaved }) {
       const { data } = await api.post('/servers/join-token', {
         name: form.name.trim(),
         tags: form.tags.trim(),
+        os:   form.os,
       })
       setTokenData(data)
       setStep('waiting')
@@ -349,11 +350,38 @@ function QuickJoinFlow({ onClose, onSaved }) {
           </ol>
         </div>
 
+        <FormField label="Operating System" required>
+          <div className="grid grid-cols-3 gap-2">
+            {[
+              { id: 'linux',   label: 'Linux',   icon: '🐧', desc: 'Ubuntu, Debian, Mint, etc.' },
+              { id: 'windows', label: 'Windows', icon: '🪟', desc: 'Win 10/11, Server 2019+' },
+              { id: 'macos',   label: 'macOS',   icon: '🍎', desc: 'Monterey & newer' },
+            ].map(o => (
+              <button
+                type="button"
+                key={o.id}
+                onClick={() => setForm(f => ({ ...f, os: o.id }))}
+                className={`p-3 rounded-xl border-2 transition-all text-left ${
+                  form.os === o.id
+                    ? 'bg-primary/10 border-primary'
+                    : 'bg-white border-gray-200 hover:border-gray-300'
+                }`}
+              >
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-xl">{o.icon}</span>
+                  <span className={`text-sm font-semibold ${form.os === o.id ? 'text-primary' : 'text-gray-700'}`}>{o.label}</span>
+                </div>
+                <p className="text-[10px] text-gray-500 leading-tight">{o.desc}</p>
+              </button>
+            ))}
+          </div>
+        </FormField>
+
         <FormField label="Server name" required>
           <input
             value={form.name}
             onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
-            placeholder="web-prod-01"
+            placeholder={form.os === 'windows' ? 'WIN-DESKTOP-01' : form.os === 'macos' ? 'mac-mini-01' : 'web-prod-01'}
             required
             minLength={1}
             maxLength={100}
@@ -368,7 +396,7 @@ function QuickJoinFlow({ onClose, onSaved }) {
           <input
             value={form.tags}
             onChange={e => setForm(f => ({ ...f, tags: e.target.value }))}
-            placeholder="production, web, db"
+            placeholder={form.os === 'windows' ? 'desktop, finance' : 'production, web, db'}
             className="input"
           />
         </FormField>
@@ -394,7 +422,12 @@ function QuickJoinFlow({ onClose, onSaved }) {
         <div className="bg-blue-50 border border-blue-200 rounded-xl p-3">
           <p className="text-xs text-blue-900 font-semibold mb-2 flex items-center gap-1.5">
             <span className="material-symbols-outlined text-base">terminal</span>
-            Run this on the new server&nbsp;<b>{tokenData.name}</b>
+            {tokenData.os === 'windows'
+              ? <>Run this in <b>PowerShell as Administrator</b> on <b>{tokenData.name}</b></>
+              : tokenData.os === 'macos'
+                ? <>Run this in <b>Terminal</b> on macOS host <b>{tokenData.name}</b></>
+                : <>Run this on the new Linux server&nbsp;<b>{tokenData.name}</b></>
+            }
           </p>
           <div className="relative">
             <pre className="bg-gray-900 text-green-300 text-xs font-mono p-3 pr-12 rounded-lg overflow-x-auto leading-relaxed whitespace-pre-wrap break-all">
