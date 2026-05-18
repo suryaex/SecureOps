@@ -6,6 +6,7 @@ Admin role required for create/update/delete; auditors can list & ping.
 """
 import secrets
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -22,6 +23,14 @@ from agent_client import ping_agent, ping_all
 # Format: {token_str: {name, tags, expires_at, used, used_at, server_id}}
 _JOIN_TOKENS: dict = {}
 _JOIN_TOKEN_TTL_HOURS = 1
+
+# Repo root = controller/backend/routers/../../..
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+INSTALL_SCRIPTS = {
+    "linux":   _REPO_ROOT / "agent-linux"   / "deploy" / "install.sh",
+    "windows": _REPO_ROOT / "agent-windows" / "deploy" / "install.ps1",
+    "macos":   _REPO_ROOT / "agent-macos"   / "deploy" / "install.sh",
+}
 
 
 def _cleanup_expired_tokens():
@@ -338,7 +347,10 @@ def join_token_status(token: str, db: Session = Depends(get_db),
 def get_install_script(token: str, request: Request, os: Optional[str] = None):
     """PUBLIC endpoint — agent downloads a personalized install bootstrap script.
 
-    Query param ?os= overrides the OS stored in the token (allows manual choice).
+    The actual install script is read from disk (agent-{os}/deploy/install.*)
+    and prefixed with token env vars. No GitHub dependency.
+
+    Query param ?os= overrides the OS stored in the token.
     Supported values: linux (default), windows, macos
     """
     tok = _JOIN_TOKENS.get(token)
@@ -354,14 +366,21 @@ def get_install_script(token: str, request: Request, os: Optional[str] = None):
     host  = request.headers.get("x-forwarded-host",  request.headers.get("host", "localhost"))
     base  = f"{proto}://{host}"
 
-    # WINDOWS - PowerShell bootstrap (ASCII-only, simpler syntax for iex compat)
+    # Read the actual installer from disk (always up-to-date with controller code)
+    script_path = INSTALL_SCRIPTS.get(target_os)
+    if not script_path or not script_path.exists():
+        raise HTTPException(500, f"Install script for OS '{target_os}' not found on controller disk")
+
+    installer_body = script_path.read_text(encoding="utf-8")
+
+    # ────────────────── WINDOWS ──────────────────
     if target_os == "windows":
-        script = (
-            "# SecureOps Agent - Windows auto-registration bootstrap\r\n"
+        # Prefix: env vars + admin check, then INLINE the full install.ps1
+        prefix = (
+            "# SecureOps Agent - Windows installer (token-injected)\r\n"
             f"# Generated for: {tok['name']}\r\n"
             f"# Expires:       {tok['expires_at'].isoformat()}Z\r\n"
             "\r\n"
-            "$ErrorActionPreference = 'Stop'\r\n"
             "Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force\r\n"
             "\r\n"
             f'$env:SECUREOPS_CONTROLLER_URL = "{base}"\r\n'
@@ -370,73 +389,65 @@ def get_install_script(token: str, request: Request, os: Optional[str] = None):
             f'$env:SECUREOPS_TAGS           = "{tok["tags"]}"\r\n'
             'if (-not $env:SECUREOPS_RECORD_SESSIONS) { $env:SECUREOPS_RECORD_SESSIONS = "1" }\r\n'
             "\r\n"
-            "# Must be admin\r\n"
+            "# Must be Administrator\r\n"
             "$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()\r\n"
             "if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {\r\n"
-            '    Write-Error "This installer must run as Administrator. Right-click PowerShell -> Run as Administrator."\r\n'
+            '    Write-Error "Must run as Administrator. Right-click PowerShell -> Run as Administrator."\r\n'
             "    exit 1\r\n"
             "}\r\n"
             "\r\n"
-            'Write-Host "==> Downloading main installer..." -ForegroundColor Green\r\n'
-            '$installerUrl = "https://raw.githubusercontent.com/suryaex/secureops/main/agent-windows/deploy/install.ps1"\r\n'
-            '$installer    = Join-Path $env:TEMP "secureops-install.ps1"\r\n'
-            "Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing\r\n"
-            "\r\n"
-            "# Run it - installer will call /api/servers/auto-register\r\n"
-            "& $installer\r\n"
         )
-        return PlainTextResponse(content=script, media_type="text/x-powershell")
+        # Combine prefix + actual installer body (read from disk)
+        # Normalize line endings to CRLF for Windows
+        body = installer_body.replace("\r\n", "\n").replace("\n", "\r\n")
+        return PlainTextResponse(content=prefix + body, media_type="text/x-powershell")
 
-    # ─── macOS — bash bootstrap dengan path ke agent-macos ───
+    # ────────────────── macOS ──────────────────
     if target_os == "macos":
-        script = f"""#!/usr/bin/env bash
-# SecureOps Agent — macOS auto-registration bootstrap
-# Generated for: {tok['name']}
-# Expires:       {tok['expires_at'].isoformat()}Z
-set -euo pipefail
+        prefix = (
+            "#!/usr/bin/env bash\n"
+            "# SecureOps Agent - macOS installer (token-injected)\n"
+            f"# Generated for: {tok['name']}\n"
+            f"# Expires:       {tok['expires_at'].isoformat()}Z\n"
+            "set -euo pipefail\n"
+            "\n"
+            f'export SECUREOPS_CONTROLLER_URL="{base}"\n'
+            f'export SECUREOPS_JOIN_TOKEN="{token}"\n'
+            f'export SECUREOPS_SERVER_NAME="{tok["name"]}"\n'
+            f'export SECUREOPS_TAGS="{tok["tags"]}"\n'
+            'export SECUREOPS_SHELL_USER="${SECUREOPS_SHELL_USER:-_secureops}"\n'
+            'export SECUREOPS_RECORD_SESSIONS="${SECUREOPS_RECORD_SESSIONS:-1}"\n'
+            "\n"
+        )
+        # Strip shebang from the body since prefix already has one
+        body = installer_body
+        if body.startswith("#!"):
+            body = body.split("\n", 1)[1] if "\n" in body else ""
+        return PlainTextResponse(content=prefix + body, media_type="text/x-shellscript")
 
-export SECUREOPS_CONTROLLER_URL="{base}"
-export SECUREOPS_JOIN_TOKEN="{token}"
-export SECUREOPS_SERVER_NAME="{tok['name']}"
-export SECUREOPS_TAGS="{tok['tags']}"
-export SECUREOPS_SHELL_USER="${{SECUREOPS_SHELL_USER:-_secureops}}"
-export SECUREOPS_RECORD_SESSIONS="${{SECUREOPS_RECORD_SESSIONS:-1}}"
-
-# Download main installer
-echo "==> Downloading main installer..."
-curl -fsSL https://raw.githubusercontent.com/suryaex/secureops/main/agent-macos/deploy/install.sh -o /tmp/secureops-install.sh
-
-# Run it
-bash /tmp/secureops-install.sh
-"""
-        return PlainTextResponse(content=script, media_type="text/x-shellscript")
-
-    # ─── LINUX (default) — bash bootstrap ───
-    script = f"""#!/usr/bin/env bash
-# SecureOps Agent — Linux auto-registration bootstrap
-# Generated for: {tok['name']}
-# Expires:       {tok['expires_at'].isoformat()}Z
-set -euo pipefail
-
-export SECUREOPS_CONTROLLER_URL="{base}"
-export SECUREOPS_JOIN_TOKEN="{token}"
-export SECUREOPS_SERVER_NAME="{tok['name']}"
-export SECUREOPS_TAGS="{tok['tags']}"
-export SECUREOPS_SHELL_USER="${{SECUREOPS_SHELL_USER:-secureops}}"
-export SECUREOPS_RECORD_SESSIONS="${{SECUREOPS_RECORD_SESSIONS:-1}}"
-
-# Ensure shell user exists (idempotent)
-id "$SECUREOPS_SHELL_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$SECUREOPS_SHELL_USER"
-
-# Download main installer
-echo "==> Downloading main installer..."
-curl -fsSL https://raw.githubusercontent.com/suryaex/secureops/main/agent-linux/deploy/install.sh -o /tmp/secureops-install.sh
-
-# Run it
-bash /tmp/secureops-install.sh
-"""
-
-    return PlainTextResponse(content=script, media_type="text/x-shellscript")
+    # ────────────────── LINUX (default) ──────────────────
+    prefix = (
+        "#!/usr/bin/env bash\n"
+        "# SecureOps Agent - Linux installer (token-injected)\n"
+        f"# Generated for: {tok['name']}\n"
+        f"# Expires:       {tok['expires_at'].isoformat()}Z\n"
+        "set -euo pipefail\n"
+        "\n"
+        f'export SECUREOPS_CONTROLLER_URL="{base}"\n'
+        f'export SECUREOPS_JOIN_TOKEN="{token}"\n'
+        f'export SECUREOPS_SERVER_NAME="{tok["name"]}"\n'
+        f'export SECUREOPS_TAGS="{tok["tags"]}"\n'
+        'export SECUREOPS_SHELL_USER="${SECUREOPS_SHELL_USER:-secureops}"\n'
+        'export SECUREOPS_RECORD_SESSIONS="${SECUREOPS_RECORD_SESSIONS:-1}"\n'
+        "\n"
+        '# Ensure shell user exists (idempotent)\n'
+        'id "$SECUREOPS_SHELL_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$SECUREOPS_SHELL_USER"\n'
+        "\n"
+    )
+    body = installer_body
+    if body.startswith("#!"):
+        body = body.split("\n", 1)[1] if "\n" in body else ""
+    return PlainTextResponse(content=prefix + body, media_type="text/x-shellscript")
 
 
 class AutoRegisterBody(BaseModel):
