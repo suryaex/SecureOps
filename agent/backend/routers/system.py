@@ -1,23 +1,16 @@
 """
-System Health, Network, and Alerts endpoints.
+System Health & Network endpoints — AGENT version.
 
-System Health -> live CPU, memory, disk, load, uptime, processes
-Network       -> interfaces, addresses, throughput, connections
-Alerts        -> aggregated alerts from audit / sudo / file-integrity / activity-failed-logins
+Returns metrics for THIS host only. The controller has its own /system router
+that aggregates across all agents.
 """
-from datetime import datetime, timedelta
-from typing import Optional
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy.orm import Session
+import os
 import platform
 import socket
-import time
-import os
 
-from database import get_db
+from fastapi import APIRouter, Depends
+
 from auth import get_current_user
-from agent_client import resolve_server, agent_get_json
-import models
 
 try:
     import psutil
@@ -27,76 +20,13 @@ except Exception:
 router = APIRouter()
 
 
-# =====================================================================
-# Fleet-wide health aggregator
-# =====================================================================
-@router.get("/fleet")
-async def fleet_health(db: Session = Depends(get_db), _user=Depends(get_current_user)):
-    """Return health summary for every enabled server (controller + agents)."""
-    import asyncio
-
-    rows = db.query(models.MonitoredServer).filter(
-        models.MonitoredServer.enabled == True
-    ).all()
-
-    async def fetch_one(srv: models.MonitoredServer):
-        try:
-            if srv.is_local:
-                # Inline call to local function — avoid loopback HTTP
-                if psutil is None:
-                    return {"server": srv.name, "ok": False, "reason": "psutil missing"}
-                cpu = psutil.cpu_percent(interval=0.2)
-                vm = psutil.virtual_memory()
-                du = psutil.disk_usage("/" if platform.system() != "Windows" else "C:\\")
-                return {
-                    "server_id": srv.id, "server": srv.name,
-                    "hostname": socket.gethostname(),
-                    "ok": True, "status": "online",
-                    "cpu": cpu, "memory": vm.percent, "disk": du.percent,
-                    "is_local": True,
-                }
-            data = await agent_get_json(srv, "/api/system/health")
-            return {
-                "server_id": srv.id, "server": srv.name,
-                "hostname": data.get("hostname"),
-                "ok": True, "status": "online",
-                "cpu": data.get("cpu", {}).get("percent"),
-                "memory": data.get("memory", {}).get("percent"),
-                "disk": data.get("disk", {}).get("percent"),
-                "uptime": data.get("uptime_seconds"),
-                "is_local": False,
-            }
-        except Exception as e:
-            return {
-                "server_id": srv.id, "server": srv.name,
-                "hostname": srv.hostname,
-                "ok": False, "status": "offline",
-                "error": str(e)[:200],
-            }
-
-    results = await asyncio.gather(*(fetch_one(s) for s in rows))
-    return {
-        "total":  len(results),
-        "online": sum(1 for r in results if r["ok"]),
-        "servers": results,
-    }
-
-
-
 @router.get("/health")
-async def system_health(
-    server_id: Optional[int] = Query(None),
-    db: Session = Depends(get_db),
-    _user=Depends(get_current_user),
-):
-    """Live OS metrics. If server_id is set, forwards to that agent."""
-    srv = resolve_server(db, server_id)
-    if srv is not None:
-        return await agent_get_json(srv, "/api/system/health")
-
+def system_health(_user=Depends(get_current_user)):
+    """Live OS metrics."""
     if psutil is None:
         return {"available": False, "reason": "psutil not installed"}
 
+    from datetime import datetime
     vm = psutil.virtual_memory()
     sm = psutil.swap_memory()
     du = psutil.disk_usage("/" if platform.system() != "Windows" else "C:\\")
@@ -151,16 +81,8 @@ async def system_health(
 
 
 @router.get("/network")
-async def system_network(
-    server_id: Optional[int] = Query(None),
-    db: Session = Depends(get_db),
-    _user=Depends(get_current_user),
-):
-    """Network info — forwards to selected agent if server_id provided."""
-    srv = resolve_server(db, server_id)
-    if srv is not None:
-        return await agent_get_json(srv, "/api/system/network")
-
+def system_network(_user=Depends(get_current_user)):
+    """Interfaces, addresses, traffic counters, listening ports."""
     if psutil is None:
         return {"available": False, "reason": "psutil not installed"}
 
@@ -219,96 +141,4 @@ async def system_network(
             "dropout": total_io.dropout,
         },
         "listening_ports": listening[:50],
-    }
-
-
-@router.get("/alerts")
-def system_alerts(db: Session = Depends(get_db), _user=Depends(get_current_user)):
-    """
-    Aggregated alerts feed.
-
-    Pulls Critical/High permission issues, modified/missing file integrity,
-    locked sudo accounts, and recent failed logins.
-    """
-    alerts = []
-
-    # Critical / High permission issues
-    perm = (db.query(models.PermissionAuditLog)
-              .filter(models.PermissionAuditLog.severity.in_(["Critical", "High"]))
-              .order_by(models.PermissionAuditLog.detected_at.desc())
-              .limit(20).all())
-    for p in perm:
-        alerts.append({
-            "id": f"perm-{p.id}",
-            "category": "Permission",
-            "severity": p.severity,
-            "title": f"{p.issue_type}",
-            "details": f"{p.file_path} (mode {p.permission_value})",
-            "timestamp": p.detected_at.isoformat() if p.detected_at else None,
-            "source": p.scanned_by or "system",
-        })
-
-    # Modified / Missing files
-    fi = (db.query(models.FileIntegrity)
-            .filter(models.FileIntegrity.status.in_(["modified", "missing"]))
-            .order_by(models.FileIntegrity.last_checked.desc())
-            .limit(20).all())
-    for f in fi:
-        alerts.append({
-            "id": f"file-{f.id}",
-            "category": "File Integrity",
-            "severity": "Critical" if f.status == "missing" else "High",
-            "title": f"File {f.status}",
-            "details": f.filename,
-            "timestamp": f.last_checked.isoformat() if f.last_checked else None,
-            "source": "fim",
-        })
-
-    # Locked sudo users
-    sudo = (db.query(models.SudoLog)
-              .filter(models.SudoLog.status == "locked")
-              .order_by(models.SudoLog.timestamp.desc())
-              .limit(20).all())
-    for s in sudo:
-        alerts.append({
-            "id": f"sudo-{s.id}",
-            "category": "Sudo Monitor",
-            "severity": "High",
-            "title": "Account locked",
-            "details": f"{s.username} ({s.failed_attempts} failed attempts)",
-            "timestamp": s.timestamp.isoformat() if s.timestamp else None,
-            "source": "sudo",
-        })
-
-    # Failed logins (last 24h)
-    since = datetime.utcnow() - timedelta(hours=24)
-    failed = (db.query(models.AdminActivityLog)
-                .filter(models.AdminActivityLog.status == "failed")
-                .filter(models.AdminActivityLog.timestamp >= since)
-                .order_by(models.AdminActivityLog.timestamp.desc())
-                .limit(15).all())
-    for f in failed:
-        alerts.append({
-            "id": f"login-{f.id}",
-            "category": "Authentication",
-            "severity": "Medium",
-            "title": f.action,
-            "details": f"{f.admin_username} from {f.ip_address}",
-            "timestamp": f.timestamp.isoformat() if f.timestamp else None,
-            "source": "auth",
-        })
-
-    sev_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
-    alerts.sort(key=lambda a: (sev_order.get(a["severity"], 9),
-                               a["timestamp"] or ""), reverse=False)
-
-    return {
-        "total": len(alerts),
-        "by_severity": {
-            "Critical": sum(1 for a in alerts if a["severity"] == "Critical"),
-            "High":     sum(1 for a in alerts if a["severity"] == "High"),
-            "Medium":   sum(1 for a in alerts if a["severity"] == "Medium"),
-            "Low":      sum(1 for a in alerts if a["severity"] == "Low"),
-        },
-        "alerts": alerts[:50],
     }
