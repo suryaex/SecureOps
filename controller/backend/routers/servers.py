@@ -354,41 +354,37 @@ def get_install_script(token: str, request: Request, os: Optional[str] = None):
     host  = request.headers.get("x-forwarded-host",  request.headers.get("host", "localhost"))
     base  = f"{proto}://{host}"
 
-    # ─── WINDOWS — PowerShell bootstrap ───
+    # WINDOWS - PowerShell bootstrap (ASCII-only, simpler syntax for iex compat)
     if target_os == "windows":
-        script = f"""# SecureOps Agent — Windows auto-registration bootstrap
-# Generated for: {tok['name']}
-# Expires:       {tok['expires_at'].isoformat()}Z
-
-$ErrorActionPreference = 'Stop'
-
-# Allow this script to run in current process
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-
-# Set environment variables for the main installer
-$env:SECUREOPS_CONTROLLER_URL = "{base}"
-$env:SECUREOPS_JOIN_TOKEN     = "{token}"
-$env:SECUREOPS_SERVER_NAME    = "{tok['name']}"
-$env:SECUREOPS_TAGS           = "{tok['tags']}"
-if (-not $env:SECUREOPS_RECORD_SESSIONS) {{
-    $env:SECUREOPS_RECORD_SESSIONS = "1"
-}}
-
-# Must be admin
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{
-    Write-Error "This installer must run as Administrator. Right-click PowerShell -> Run as Administrator."
-    exit 1
-}}
-
-# Download main installer
-Write-Host "==> Downloading main installer..." -ForegroundColor Green
-$installerUrl = "https://raw.githubusercontent.com/suryaex/secureops/main/agent-windows/deploy/install.ps1"
-$installer    = "$env:TEMP\\secureops-install.ps1"
-Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing
-
-# Run it — the installer will call back to {base}/api/servers/auto-register
-& $installer
-"""
+        script = (
+            "# SecureOps Agent - Windows auto-registration bootstrap\r\n"
+            f"# Generated for: {tok['name']}\r\n"
+            f"# Expires:       {tok['expires_at'].isoformat()}Z\r\n"
+            "\r\n"
+            "$ErrorActionPreference = 'Stop'\r\n"
+            "Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force\r\n"
+            "\r\n"
+            f'$env:SECUREOPS_CONTROLLER_URL = "{base}"\r\n'
+            f'$env:SECUREOPS_JOIN_TOKEN     = "{token}"\r\n'
+            f'$env:SECUREOPS_SERVER_NAME    = "{tok["name"]}"\r\n'
+            f'$env:SECUREOPS_TAGS           = "{tok["tags"]}"\r\n'
+            'if (-not $env:SECUREOPS_RECORD_SESSIONS) { $env:SECUREOPS_RECORD_SESSIONS = "1" }\r\n'
+            "\r\n"
+            "# Must be admin\r\n"
+            "$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()\r\n"
+            "if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {\r\n"
+            '    Write-Error "This installer must run as Administrator. Right-click PowerShell -> Run as Administrator."\r\n'
+            "    exit 1\r\n"
+            "}\r\n"
+            "\r\n"
+            'Write-Host "==> Downloading main installer..." -ForegroundColor Green\r\n'
+            '$installerUrl = "https://raw.githubusercontent.com/suryaex/secureops/main/agent-windows/deploy/install.ps1"\r\n'
+            '$installer    = Join-Path $env:TEMP "secureops-install.ps1"\r\n'
+            "Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing\r\n"
+            "\r\n"
+            "# Run it - installer will call /api/servers/auto-register\r\n"
+            "& $installer\r\n"
+        )
         return PlainTextResponse(content=script, media_type="text/x-powershell")
 
     # ─── macOS — bash bootstrap dengan path ke agent-macos ───
