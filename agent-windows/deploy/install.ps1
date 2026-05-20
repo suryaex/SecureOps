@@ -255,20 +255,119 @@ $acl.AddAccessRule($adminRule)
 Set-Acl "$ConfigDir\key" $acl
 
 # ============================== DOWNLOAD NSSM ==============================
-$NssmDir = "$InstallDir\nssm"
-$NssmExe = "$NssmDir\win64\nssm.exe"
+# NSSM (Non-Sucking Service Manager) untuk wrap uvicorn jadi Windows Service.
+# Server nssm.cc kadang 503 — pakai multiple mirrors dengan retry.
+$NssmDir = Join-Path $InstallDir "nssm"
+$NssmExe = Join-Path $NssmDir "win64\nssm.exe"
+
+if (-not (Test-Path $NssmExe)) {
+    # Cara 1: Cek apakah ada nssm.exe yang sudah di-bundle di repo
+    $BundledNssm = Join-Path (Split-Path $PSCommandPath) "bundled\nssm.exe"
+    if (Test-Path $BundledNssm) {
+        Say "Using bundled NSSM from $BundledNssm..."
+        New-Item -ItemType Directory -Path (Split-Path $NssmExe) -Force | Out-Null
+        Copy-Item $BundledNssm $NssmExe -Force
+        Info "NSSM ready (bundled)"
+    }
+}
+
 if (-not (Test-Path $NssmExe)) {
     Say "Downloading NSSM (service manager)..."
-    $nssmZip = "$env:TEMP\nssm.zip"
-    Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile $nssmZip -UseBasicParsing
-    Expand-Archive -Path $nssmZip -DestinationPath $NssmDir -Force
 
-    $extracted = Get-ChildItem $NssmDir -Directory | Select-Object -First 1
-    if ($extracted -and $extracted.Name -ne "win64") {
-        Move-Item "$NssmDir\$($extracted.Name)\win64" $NssmDir -Force
-        Remove-Item "$NssmDir\$($extracted.Name)" -Recurse -Force
+    # Multiple mirror URLs untuk tahan banting kalau primary down.
+    # GitHub-hosted mirrors lebih reliable daripada nssm.cc.
+    $NssmMirrors = @(
+        "https://github.com/suryaex/secureops/releases/download/nssm-2.24/nssm-2.24.zip",  # repo release (paling reliable)
+        "https://nssm.cc/release/nssm-2.24.zip",                                            # canonical
+        "https://nssm.cc/ci/nssm-2.24-101-g897c7ad.zip",                                    # canonical CI build
+        "https://web.archive.org/web/2024*/https://nssm.cc/release/nssm-2.24.zip"           # Wayback Machine
+    )
+
+    $nssmZip = Join-Path $env:TEMP "nssm.zip"
+    $downloaded = $false
+
+    foreach ($url in $NssmMirrors) {
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                Info "Mirror: $url (attempt $attempt/3)"
+                Invoke-WebRequest -Uri $url -OutFile $nssmZip -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+                if ((Get-Item $nssmZip).Length -gt 100000) {
+                    # NSSM zip should be ~330KB; if smaller, probably error page
+                    $downloaded = $true
+                    Info "NSSM downloaded successfully ($('{0:N0}' -f (Get-Item $nssmZip).Length) bytes)"
+                    break
+                } else {
+                    Warn "Downloaded file too small, likely an error page. Trying next."
+                    Remove-Item $nssmZip -Force -ErrorAction SilentlyContinue
+                }
+            } catch {
+                Warn "Failed: $($_.Exception.Message)"
+                Start-Sleep -Seconds (2 * $attempt)
+            }
+        }
+        if ($downloaded) { break }
     }
-    Remove-Item $nssmZip -Force
+
+    if (-not $downloaded) {
+        # Final fallback: cek apakah ada nssm.exe di system PATH (mungkin user install via Chocolatey/Scoop)
+        $sysNssm = Get-Command nssm -ErrorAction SilentlyContinue
+        if ($sysNssm) {
+            Info "Using system-installed NSSM at $($sysNssm.Source)"
+            New-Item -ItemType Directory -Path (Split-Path $NssmExe) -Force | Out-Null
+            Copy-Item $sysNssm.Source $NssmExe -Force
+            $downloaded = $true
+        }
+    }
+
+    if (-not $downloaded) {
+        Write-Host ""
+        Write-Host "==========================================================" -ForegroundColor Red
+        Write-Host "  NSSM DOWNLOAD FAILED" -ForegroundColor Red
+        Write-Host "==========================================================" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "Server NSSM (nssm.cc) sedang tidak responsif." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "OPSI 1 - Install NSSM via Chocolatey:" -ForegroundColor Cyan
+        Write-Host "  Set-ExecutionPolicy Bypass -Scope Process -Force" -ForegroundColor White
+        Write-Host "  iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))" -ForegroundColor White
+        Write-Host "  choco install nssm -y" -ForegroundColor White
+        Write-Host "  # Lalu jalankan ulang installer SecureOps" -ForegroundColor White
+        Write-Host ""
+        Write-Host "OPSI 2 - Manual download:" -ForegroundColor Cyan
+        Write-Host "  1. Coba lagi nanti, atau download dari mirror lain"
+        Write-Host "  2. Extract zip-nya ke: $NssmDir"
+        Write-Host "  3. Pastikan ada file: $NssmExe"
+        Write-Host "  4. Jalankan ulang installer ini"
+        Write-Host ""
+        Die "Cannot proceed without NSSM."
+    }
+
+    # Extract zip
+    try {
+        Expand-Archive -Path $nssmZip -DestinationPath $NssmDir -Force -ErrorAction Stop
+    } catch {
+        Die "Failed to extract NSSM zip: $($_.Exception.Message)"
+    }
+
+    # Normalisasi struktur folder ke $NssmDir/win64/nssm.exe
+    if (-not (Test-Path $NssmExe)) {
+        # Cari nssm.exe yang ter-extract (mungkin di subfolder)
+        $found = Get-ChildItem $NssmDir -Recurse -Filter "nssm.exe" | Where-Object {
+            $_.Directory.Name -eq "win64"
+        } | Select-Object -First 1
+        if ($found) {
+            $win64Dir = Join-Path $NssmDir "win64"
+            New-Item -ItemType Directory -Path $win64Dir -Force | Out-Null
+            Copy-Item $found.FullName $NssmExe -Force
+        }
+    }
+
+    if (-not (Test-Path $NssmExe)) {
+        Die "NSSM extracted but nssm.exe tidak ditemukan di $NssmExe"
+    }
+
+    Remove-Item $nssmZip -Force -ErrorAction SilentlyContinue
+    Info "NSSM ready at $NssmExe"
 }
 
 # ============================== INSTALL SERVICE ==============================
