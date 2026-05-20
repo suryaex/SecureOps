@@ -48,18 +48,69 @@ if (-not $AgentKey) {
 }
 
 # ============================== PYTHON ==============================
-$python = Get-Command python -ErrorAction SilentlyContinue
-if (-not $python) {
-    Say "Python not found - installing Python 3.12..."
-    $pyInstaller = "$env:TEMP\python-installer.exe"
-    Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe" -OutFile $pyInstaller -UseBasicParsing
-    Start-Process $pyInstaller -Wait -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0"
-    Remove-Item $pyInstaller -Force
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+# Cari Python 3.12 atau 3.13 (paling stabil + semua wheel tersedia).
+# Hindari Python 3.14+ karena banyak package belum punya pre-built wheel
+# untuk Windows (akan coba compile dari source, butuh Rust + MSVC linker).
+
+$PreferredPyVersions = @("3.12", "3.13")
+$PythonExe = $null
+
+# Cara 1: py launcher (Python for Windows installer)
+$pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+if ($pyLauncher) {
+    foreach ($v in $PreferredPyVersions) {
+        $check = & py "-$v" --version 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $PythonExe = (& py "-$v" -c "import sys; print(sys.executable)").Trim()
+            Info "Found compatible Python via py launcher: $check ($PythonExe)"
+            break
+        }
+    }
 }
 
-$pyVersion = & python --version 2>&1
-Info "Python: $pyVersion"
+# Cara 2: direct python.exe (cek apakah versinya 3.10-3.13)
+if (-not $PythonExe) {
+    $directPy = Get-Command python -ErrorAction SilentlyContinue
+    if ($directPy) {
+        $verStr = & python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
+        if ($verStr -and $verStr -match "^3\.(10|11|12|13)$") {
+            $PythonExe = $directPy.Source
+            Info "Found compatible Python: $verStr ($PythonExe)"
+        } else {
+            Warn "Python $verStr is not optimal (need 3.10-3.13). Will install Python 3.12."
+        }
+    }
+}
+
+# Cara 3: install Python 3.12 manually
+if (-not $PythonExe) {
+    Say "Compatible Python (3.10-3.13) not found - installing Python 3.12.7..."
+    $pyInstaller = Join-Path $env:TEMP "python-3.12.7-installer.exe"
+    Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe" -OutFile $pyInstaller -UseBasicParsing
+    # Install for all users, prepend PATH, no test suite
+    Start-Process $pyInstaller -Wait -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_launcher=1"
+    Remove-Item $pyInstaller -Force
+
+    # Refresh PATH dalam current process
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+                [System.Environment]::GetEnvironmentVariable("Path", "User")
+
+    # Try py launcher again
+    foreach ($v in $PreferredPyVersions) {
+        $check = & py "-$v" --version 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $PythonExe = (& py "-$v" -c "import sys; print(sys.executable)").Trim()
+            Info "Installed Python: $check"
+            break
+        }
+    }
+
+    if (-not $PythonExe) {
+        Die "Python 3.12 installation failed. Please install manually from https://www.python.org/downloads/release/python-3127/"
+    }
+}
+
+Info "Will use: $PythonExe"
 
 # ============================== GIT ==============================
 $git = Get-Command git -ErrorAction SilentlyContinue
@@ -85,16 +136,52 @@ if (Test-Path "$InstallDir\.git") {
 # ============================== PYTHON VENV ==============================
 $BackendDir = "$InstallDir\agent-windows\backend"
 $VenvDir    = "$BackendDir\venv"
+$VenvPython = Join-Path $VenvDir "Scripts\python.exe"
+$VenvPip    = Join-Path $VenvDir "Scripts\pip.exe"
 
-Say "Setting up Python venv..."
-if (-not (Test-Path $VenvDir)) {
-    Push-Location $BackendDir
-    & python -m venv venv
-    Pop-Location
+# Buang venv lama kalau ada (mungkin dari Python version berbeda)
+if (Test-Path $VenvDir) {
+    Say "Removing existing venv..."
+    Remove-Item $VenvDir -Recurse -Force
 }
 
-& "$VenvDir\Scripts\python.exe" -m pip install --quiet --upgrade pip setuptools wheel
-& "$VenvDir\Scripts\pip.exe" install --quiet -r "$BackendDir\requirements.txt"
+Say "Setting up Python venv with $PythonExe..."
+& $PythonExe -m venv $VenvDir
+if (-not (Test-Path $VenvPython)) {
+    Die "Failed to create venv. Python at $PythonExe may be broken."
+}
+
+# Verifikasi venv pakai Python yang benar
+$venvVer = & $VenvPython -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+Info "Venv Python: $venvVer"
+
+Say "Installing core dependencies (fastapi, uvicorn, psutil, websockets, etc.)..."
+& $VenvPython -m pip install --quiet --upgrade pip setuptools wheel
+& $VenvPip install --quiet -r "$BackendDir\requirements.txt"
+if ($LASTEXITCODE -ne 0) {
+    Die "Failed to install core Python dependencies. Check Python version + internet connection."
+}
+
+# pywinpty di-install TERPISAH (optional, hanya untuk fitur terminal).
+# Bisa gagal di Python 3.14+ karena belum ada wheel — di-handle gracefully.
+Say "Installing pywinpty for terminal feature (optional)..."
+$pywinptyOK = $false
+try {
+    & $VenvPip install --quiet pywinpty 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        $pywinptyOK = $true
+        Info "pywinpty installed - terminal feature enabled"
+    }
+} catch {}
+
+if (-not $pywinptyOK) {
+    Warn "pywinpty install failed - terminal feature will be DISABLED"
+    Warn "Common cause: Python 3.14 has no pre-built wheel yet."
+    Warn "Other features (system health, audit, sudo, FIM) tetap berfungsi."
+    Warn "Untuk enable terminal nanti:"
+    Warn "  1. Install Visual Studio Build Tools dengan C++ workload"
+    Warn "  2. Jalankan: $VenvPip install pywinpty"
+}
 
 # ============================== SAVE KEY ==============================
 New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null
