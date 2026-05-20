@@ -71,6 +71,26 @@ class AdminActivityLog(Base):
     status = Column(String(20), default="success")
 
 
+class JoinToken(Base):
+    """
+    One-time token for agent auto-registration.
+    Stored in DB (not in-memory) so it's shared across all gunicorn workers.
+    """
+    __tablename__ = "join_tokens"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    token       = Column(String(100), unique=True, nullable=False, index=True)
+    name        = Column(String(100), nullable=False)
+    tags        = Column(String(500), nullable=True)
+    target_os   = Column(String(20), default="linux")     # linux / windows / macos
+    used        = Column(Boolean, default=False)
+    used_at     = Column(DateTime, nullable=True)
+    server_id   = Column(Integer, nullable=True)
+    created_by  = Column(String(100), nullable=True)
+    created_at  = Column(DateTime, server_default=func.now())
+    expires_at  = Column(DateTime, nullable=False)
+
+
 class MonitoredServer(Base):
     """
     A remote server in the fleet — has an agent running SecureOps in

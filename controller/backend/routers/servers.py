@@ -19,9 +19,7 @@ import models
 from auth import get_current_user, require_admin
 from agent_client import ping_agent, ping_all
 
-# In-memory join token store (1 hour TTL)
-# Format: {token_str: {name, tags, expires_at, used, used_at, server_id}}
-_JOIN_TOKENS: dict = {}
+# Join tokens stored in DB (models.JoinToken) — shared across all workers
 _JOIN_TOKEN_TTL_HOURS = 1
 
 # Repo root = controller/backend/routers/../../..
@@ -33,12 +31,11 @@ INSTALL_SCRIPTS = {
 }
 
 
-def _cleanup_expired_tokens():
-    """Drop tokens older than 24 hours from memory."""
+def _cleanup_expired_tokens(db: Session):
+    """Drop tokens older than 24 hours from DB."""
     cutoff = datetime.utcnow() - timedelta(hours=24)
-    for t in list(_JOIN_TOKENS.keys()):
-        if _JOIN_TOKENS[t]["expires_at"] < cutoff:
-            del _JOIN_TOKENS[t]
+    db.query(models.JoinToken).filter(models.JoinToken.expires_at < cutoff).delete()
+    db.commit()
 
 router = APIRouter()
 
@@ -241,35 +238,40 @@ def create_join_token(body: JoinTokenCreate, request: Request,
                       db: Session = Depends(get_db),
                       current=Depends(require_admin)):
     """Admin creates a one-time join token. Returns the install command."""
-    _cleanup_expired_tokens()
+    _cleanup_expired_tokens(db)
 
     # Make sure name isn't already taken
     if db.query(models.MonitoredServer).filter(models.MonitoredServer.name == body.name).first():
         raise HTTPException(409, f"Server name '{body.name}' already exists")
 
     # Check pending tokens for same name
-    for existing in _JOIN_TOKENS.values():
-        if existing["name"] == body.name and not existing["used"] and existing["expires_at"] > datetime.utcnow():
-            raise HTTPException(409, f"A pending join token for '{body.name}' already exists. Wait for it to expire (max {_JOIN_TOKEN_TTL_HOURS}h) or pick another name.")
-
-    token = secrets.token_urlsafe(24)
-    expires_at = datetime.utcnow() + timedelta(hours=_JOIN_TOKEN_TTL_HOURS)
+    pending = db.query(models.JoinToken).filter(
+        models.JoinToken.name == body.name,
+        models.JoinToken.used == False,
+        models.JoinToken.expires_at > datetime.utcnow(),
+    ).first()
+    if pending:
+        raise HTTPException(409, f"A pending join token for '{body.name}' already exists. Wait for it to expire (max {_JOIN_TOKEN_TTL_HOURS}h) or pick another name.")
 
     # Validate OS
     target_os = (body.os or "linux").lower().strip()
     if target_os not in ("linux", "windows", "macos"):
         raise HTTPException(400, f"Invalid OS '{target_os}'. Use linux/windows/macos.")
 
-    _JOIN_TOKENS[token] = {
-        "name":       body.name,
-        "tags":       (body.tags or "").strip(),
-        "os":         target_os,
-        "expires_at": expires_at,
-        "used":       False,
-        "used_at":    None,
-        "server_id":  None,
-        "created_by": current.username,
-    }
+    token      = secrets.token_urlsafe(24)
+    expires_at = datetime.utcnow() + timedelta(hours=_JOIN_TOKEN_TTL_HOURS)
+
+    db_token = models.JoinToken(
+        token=token,
+        name=body.name,
+        tags=(body.tags or "").strip(),
+        target_os=target_os,
+        used=False,
+        expires_at=expires_at,
+        created_by=current.username,
+    )
+    db.add(db_token)
+    db.commit()
 
     # Build absolute public URL from request
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
@@ -317,56 +319,62 @@ def create_join_token(body: JoinTokenCreate, request: Request,
 def join_token_status(token: str, db: Session = Depends(get_db),
                       _user=Depends(get_current_user)):
     """Polled by the UI to check if the agent has registered yet."""
-    tok = _JOIN_TOKENS.get(token)
+    tok = db.query(models.JoinToken).filter(models.JoinToken.token == token).first()
     if not tok:
         raise HTTPException(404, "Token not found")
 
-    if tok["used"] and tok["server_id"]:
-        srv = db.query(models.MonitoredServer).filter(models.MonitoredServer.id == tok["server_id"]).first()
+    if tok.used and tok.server_id:
+        srv = db.query(models.MonitoredServer).filter(models.MonitoredServer.id == tok.server_id).first()
         return {
             "status":      "registered",
             "used":        True,
-            "server_id":   tok["server_id"],
-            "server_name": srv.name if srv else tok["name"],
+            "server_id":   tok.server_id,
+            "server_name": srv.name if srv else tok.name,
             "hostname":    srv.hostname if srv else None,
             "api_url":     srv.api_url if srv else None,
             "last_status": srv.last_status if srv else None,
         }
 
-    if tok["expires_at"] < datetime.utcnow():
+    if tok.expires_at < datetime.utcnow():
         return {"status": "expired", "used": False}
 
     return {
         "status":     "pending",
         "used":       False,
-        "expires_at": tok["expires_at"].isoformat() + "Z",
+        "expires_at": tok.expires_at.isoformat() + "Z",
     }
 
 
 @router.get("/install-script/{token}", response_class=PlainTextResponse)
-def get_install_script(token: str, request: Request, os: Optional[str] = None):
-    """PUBLIC endpoint — agent downloads a personalized install bootstrap script.
+def get_install_script(token: str, request: Request,
+                       os: Optional[str] = None,
+                       db: Session = Depends(get_db)):
+    """PUBLIC endpoint — agent downloads a personalized install script.
 
-    The actual install script is read from disk (agent-{os}/deploy/install.*)
+    Install script is read from controller's local disk (agent-{os}/deploy/install.*)
     and prefixed with token env vars. No GitHub dependency.
-
-    Query param ?os= overrides the OS stored in the token.
-    Supported values: linux (default), windows, macos
     """
-    tok = _JOIN_TOKENS.get(token)
+    tok = db.query(models.JoinToken).filter(models.JoinToken.token == token).first()
     if not tok:
         raise HTTPException(404, "Invalid token")
-    if tok["used"]:
+    if tok.used:
         raise HTTPException(410, "Token already used")
-    if tok["expires_at"] < datetime.utcnow():
+    if tok.expires_at < datetime.utcnow():
         raise HTTPException(410, "Token expired")
 
-    target_os = (os or tok.get("os") or "linux").lower()
+    # Build a dict-like view for backward-compatible templating below
+    tok_dict = {
+        "name":       tok.name,
+        "tags":       tok.tags or "",
+        "expires_at": tok.expires_at,
+    }
+
+    target_os = (os or tok.target_os or "linux").lower()
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     host  = request.headers.get("x-forwarded-host",  request.headers.get("host", "localhost"))
     base  = f"{proto}://{host}"
 
-    # Read the actual installer from disk (always up-to-date with controller code)
+    # Read the actual installer from disk
     script_path = INSTALL_SCRIPTS.get(target_os)
     if not script_path or not script_path.exists():
         raise HTTPException(500, f"Install script for OS '{target_os}' not found on controller disk")
@@ -378,15 +386,15 @@ def get_install_script(token: str, request: Request, os: Optional[str] = None):
         # Prefix: env vars + admin check, then INLINE the full install.ps1
         prefix = (
             "# SecureOps Agent - Windows installer (token-injected)\r\n"
-            f"# Generated for: {tok['name']}\r\n"
-            f"# Expires:       {tok['expires_at'].isoformat()}Z\r\n"
+            f"# Generated for: {tok_dict['name']}\r\n"
+            f"# Expires:       {tok_dict['expires_at'].isoformat()}Z\r\n"
             "\r\n"
             "Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force\r\n"
             "\r\n"
             f'$env:SECUREOPS_CONTROLLER_URL = "{base}"\r\n'
             f'$env:SECUREOPS_JOIN_TOKEN     = "{token}"\r\n'
-            f'$env:SECUREOPS_SERVER_NAME    = "{tok["name"]}"\r\n'
-            f'$env:SECUREOPS_TAGS           = "{tok["tags"]}"\r\n'
+            f'$env:SECUREOPS_SERVER_NAME    = "{tok_dict["name"]}"\r\n'
+            f'$env:SECUREOPS_TAGS           = "{tok_dict["tags"]}"\r\n'
             'if (-not $env:SECUREOPS_RECORD_SESSIONS) { $env:SECUREOPS_RECORD_SESSIONS = "1" }\r\n'
             "\r\n"
             "# Must be Administrator\r\n"
@@ -407,14 +415,14 @@ def get_install_script(token: str, request: Request, os: Optional[str] = None):
         prefix = (
             "#!/usr/bin/env bash\n"
             "# SecureOps Agent - macOS installer (token-injected)\n"
-            f"# Generated for: {tok['name']}\n"
-            f"# Expires:       {tok['expires_at'].isoformat()}Z\n"
+            f"# Generated for: {tok_dict['name']}\n"
+            f"# Expires:       {tok_dict['expires_at'].isoformat()}Z\n"
             "set -euo pipefail\n"
             "\n"
             f'export SECUREOPS_CONTROLLER_URL="{base}"\n'
             f'export SECUREOPS_JOIN_TOKEN="{token}"\n'
-            f'export SECUREOPS_SERVER_NAME="{tok["name"]}"\n'
-            f'export SECUREOPS_TAGS="{tok["tags"]}"\n'
+            f'export SECUREOPS_SERVER_NAME="{tok_dict["name"]}"\n'
+            f'export SECUREOPS_TAGS="{tok_dict["tags"]}"\n'
             'export SECUREOPS_SHELL_USER="${SECUREOPS_SHELL_USER:-_secureops}"\n'
             'export SECUREOPS_RECORD_SESSIONS="${SECUREOPS_RECORD_SESSIONS:-1}"\n'
             "\n"
@@ -429,14 +437,14 @@ def get_install_script(token: str, request: Request, os: Optional[str] = None):
     prefix = (
         "#!/usr/bin/env bash\n"
         "# SecureOps Agent - Linux installer (token-injected)\n"
-        f"# Generated for: {tok['name']}\n"
-        f"# Expires:       {tok['expires_at'].isoformat()}Z\n"
+        f"# Generated for: {tok_dict['name']}\n"
+        f"# Expires:       {tok_dict['expires_at'].isoformat()}Z\n"
         "set -euo pipefail\n"
         "\n"
         f'export SECUREOPS_CONTROLLER_URL="{base}"\n'
         f'export SECUREOPS_JOIN_TOKEN="{token}"\n'
-        f'export SECUREOPS_SERVER_NAME="{tok["name"]}"\n'
-        f'export SECUREOPS_TAGS="{tok["tags"]}"\n'
+        f'export SECUREOPS_SERVER_NAME="{tok_dict["name"]}"\n'
+        f'export SECUREOPS_TAGS="{tok_dict["tags"]}"\n'
         'export SECUREOPS_SHELL_USER="${SECUREOPS_SHELL_USER:-secureops}"\n'
         'export SECUREOPS_RECORD_SESSIONS="${SECUREOPS_RECORD_SESSIONS:-1}"\n'
         "\n"
@@ -464,24 +472,24 @@ def auto_register(body: AutoRegisterBody, request: Request,
     PUBLIC endpoint — called by the agent at the end of install to self-register.
     Consumes the one-time join token and creates a MonitoredServer row.
     """
-    tok = _JOIN_TOKENS.get(body.token)
+    tok = db.query(models.JoinToken).filter(models.JoinToken.token == body.token).first()
     if not tok:
         raise HTTPException(404, "Invalid token")
-    if tok["used"]:
+    if tok.used:
         raise HTTPException(410, "Token already used")
-    if tok["expires_at"] < datetime.utcnow():
+    if tok.expires_at < datetime.utcnow():
         raise HTTPException(410, "Token expired")
 
     # Double-check name still free (race condition guard)
-    if db.query(models.MonitoredServer).filter(models.MonitoredServer.name == tok["name"]).first():
-        raise HTTPException(409, f"Server name '{tok['name']}' was registered by someone else")
+    if db.query(models.MonitoredServer).filter(models.MonitoredServer.name == tok.name).first():
+        raise HTTPException(409, f"Server name '{tok.name}' was registered by someone else")
 
     srv = models.MonitoredServer(
-        name=tok["name"],
+        name=tok.name,
         hostname=body.hostname.strip(),
         api_url=body.api_url.rstrip("/"),
         api_key=body.api_key,
-        tags=tok["tags"],
+        tags=tok.tags or "",
         enabled=True,
         is_local=False,
         last_status="online",
@@ -491,9 +499,10 @@ def auto_register(body: AutoRegisterBody, request: Request,
     db.commit()
     db.refresh(srv)
 
-    tok["used"]      = True
-    tok["used_at"]   = datetime.utcnow()
-    tok["server_id"] = srv.id
+    tok.used      = True
+    tok.used_at   = datetime.utcnow()
+    tok.server_id = srv.id
+    db.commit()
 
     db.add(models.AdminActivityLog(
         admin_id=None,
