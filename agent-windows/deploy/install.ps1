@@ -48,69 +48,130 @@ if (-not $AgentKey) {
 }
 
 # ============================== PYTHON ==============================
-# Cari Python 3.12 atau 3.13 (paling stabil + semua wheel tersedia).
-# Hindari Python 3.14+ karena banyak package belum punya pre-built wheel
-# untuk Windows (akan coba compile dari source, butuh Rust + MSVC linker).
+# Cari Python 3.10-3.13 (paling stabil + semua wheel tersedia).
+# Hindari Python 3.14+ karena banyak package belum punya pre-built wheel.
+# Semua operasi di-wrap try/catch supaya stderr dari py.exe gak terminate script.
 
-$PreferredPyVersions = @("3.12", "3.13")
+$PreferredPyVersions = @("3.13", "3.12", "3.11", "3.10")
 $PythonExe = $null
 
-# Cara 1: py launcher (Python for Windows installer)
-$pyLauncher = Get-Command py -ErrorAction SilentlyContinue
-if ($pyLauncher) {
-    foreach ($v in $PreferredPyVersions) {
-        $check = & py "-$v" --version 2>$null
-        if ($LASTEXITCODE -eq 0) {
-            $PythonExe = (& py "-$v" -c "import sys; print(sys.executable)").Trim()
-            Info "Found compatible Python via py launcher: $check ($PythonExe)"
-            break
+function Test-PythonExe([string]$ExePath) {
+    if (-not (Test-Path $ExePath)) { return $null }
+    try {
+        $ver = & $ExePath -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>&1
+        if ($LASTEXITCODE -eq 0 -and $ver -match "^3\.(10|11|12|13)$") {
+            return $ver.Trim()
         }
+    } catch {}
+    return $null
+}
+
+# Cara 1: Cek path standard tempat installer Python masuk
+$standardPaths = @(
+    "C:\Python313\python.exe",
+    "C:\Python312\python.exe",
+    "C:\Python311\python.exe",
+    "C:\Python310\python.exe",
+    "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",
+    "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
+    "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
+    "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
+)
+foreach ($p in $standardPaths) {
+    $ver = Test-PythonExe $p
+    if ($ver) {
+        $PythonExe = $p
+        Info "Found Python $ver at $p"
+        break
     }
 }
 
-# Cara 2: direct python.exe (cek apakah versinya 3.10-3.13)
+# Cara 2: py launcher with --list (cek apa yang ter-install)
 if (-not $PythonExe) {
-    $directPy = Get-Command python -ErrorAction SilentlyContinue
-    if ($directPy) {
-        $verStr = & python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
-        if ($verStr -and $verStr -match "^3\.(10|11|12|13)$") {
-            $PythonExe = $directPy.Source
-            Info "Found compatible Python: $verStr ($PythonExe)"
+    try {
+        $pyAvailable = @()
+        # py --list selalu sukses kalau py launcher ada; output ke stderr
+        $listRaw = (& py --list 2>&1) -join "`n"
+        foreach ($line in $listRaw -split "`r?`n") {
+            if ($line -match "-V:(\d+\.\d+)") {
+                $pyAvailable += $matches[1]
+            }
+        }
+        Info "py launcher Pythons: $($pyAvailable -join ', ')"
+
+        foreach ($v in $PreferredPyVersions) {
+            if ($pyAvailable -contains $v) {
+                $candidate = (& py "-$v" -c "import sys; print(sys.executable)" 2>&1).Trim()
+                if ((Test-PythonExe $candidate)) {
+                    $PythonExe = $candidate
+                    Info "Found via py launcher: Python $v at $candidate"
+                    break
+                }
+            }
+        }
+    } catch {
+        # py launcher gagal — skip ke cara 3
+    }
+}
+
+# Cara 3: direct python.exe di PATH (cek versinya)
+if (-not $PythonExe) {
+    try {
+        $directPy = (Get-Command python -ErrorAction Stop).Source
+        $ver = Test-PythonExe $directPy
+        if ($ver) {
+            $PythonExe = $directPy
+            Info "Found python.exe in PATH: Python $ver at $directPy"
         } else {
-            Warn "Python $verStr is not optimal (need 3.10-3.13). Will install Python 3.12."
+            Warn "python.exe found but version not compatible (need 3.10-3.13). Will install Python 3.12."
         }
+    } catch {
+        # python.exe tidak di PATH
     }
 }
 
-# Cara 3: install Python 3.12 manually
+# Cara 4: install Python 3.12 manual
 if (-not $PythonExe) {
-    Say "Compatible Python (3.10-3.13) not found - installing Python 3.12.7..."
+    Say "Compatible Python (3.10-3.13) tidak ditemukan - installing Python 3.12.7..."
     $pyInstaller = Join-Path $env:TEMP "python-3.12.7-installer.exe"
-    Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe" -OutFile $pyInstaller -UseBasicParsing
-    # Install for all users, prepend PATH, no test suite
-    Start-Process $pyInstaller -Wait -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_launcher=1"
-    Remove-Item $pyInstaller -Force
+    try {
+        Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe" `
+                          -OutFile $pyInstaller -UseBasicParsing -TimeoutSec 120
+    } catch {
+        Die "Gagal download Python 3.12.7 installer: $_"
+    }
 
-    # Refresh PATH dalam current process
+    Say "Running Python installer (silent, all users, +PATH, +launcher)..."
+    # InstallAllUsers=1 → C:\Python312 (system-wide)
+    # PrependPath=1     → add to PATH
+    # Include_launcher=1 → register py launcher
+    # Include_test=0    → skip test suite (smaller)
+    $proc = Start-Process $pyInstaller -Wait -PassThru -ArgumentList @(
+        "/quiet", "InstallAllUsers=1", "PrependPath=1",
+        "Include_launcher=1", "Include_test=0", "SimpleInstall=1"
+    )
+    Remove-Item $pyInstaller -Force -ErrorAction SilentlyContinue
+
+    if ($proc.ExitCode -ne 0) {
+        Die "Python 3.12.7 installer exited dengan code $($proc.ExitCode). Install manually dari https://www.python.org/downloads/release/python-3127/"
+    }
+
+    # Refresh PATH dalam current PowerShell session
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
                 [System.Environment]::GetEnvironmentVariable("Path", "User")
 
-    # Try py launcher again
-    foreach ($v in $PreferredPyVersions) {
-        $check = & py "-$v" --version 2>$null
-        if ($LASTEXITCODE -eq 0) {
-            $PythonExe = (& py "-$v" -c "import sys; print(sys.executable)").Trim()
-            Info "Installed Python: $check"
-            break
-        }
-    }
-
-    if (-not $PythonExe) {
-        Die "Python 3.12 installation failed. Please install manually from https://www.python.org/downloads/release/python-3127/"
+    # Cek apakah Python 3.12 sekarang ada
+    $candidate = "C:\Python312\python.exe"
+    $ver = Test-PythonExe $candidate
+    if ($ver) {
+        $PythonExe = $candidate
+        Info "Successfully installed Python $ver at $candidate"
+    } else {
+        Die "Python 3.12 ke-install tapi C:\Python312\python.exe tidak ditemukan. Coba restart PowerShell dan jalankan installer lagi."
     }
 }
 
-Info "Will use: $PythonExe"
+Info "Will use Python: $PythonExe"
 
 # ============================== GIT ==============================
 $git = Get-Command git -ErrorAction SilentlyContinue
