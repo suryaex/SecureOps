@@ -25,45 +25,66 @@ DEMO_SUDO_USERS = [
     ("sysbackup",  "wheel,backup",     "active", 0, "sudo rsync -avz /"),
 ]
 
-SUDO_GROUPS = {"sudo", "wheel", "admin", "adm", "root"}
+# macOS uses 'admin' group for sudo access. 'wheel' exists at GID 0 (root group).
+# UID convention: 0=root, 1-500=system, 501+=regular users (vs Linux 1000+)
+SUDO_GROUPS = {"admin", "wheel", "root"}
 
 
-def _enumerate_linux_sudo_users(db: Session, scanned_by: str):
-    """Real enumeration of OS users belonging to sudo/wheel/admin groups."""
-    import pwd, grp, os
+def _enumerate_macos_sudo_users(db: Session, scanned_by: str):
+    """Real enumeration of OS users belonging to admin/wheel groups on macOS."""
+    import pwd, grp, os, subprocess
 
     start = time.time()
     sudo_members: set[str] = set()
 
-    # Members listed in the sudo/wheel groups themselves
+    # Members listed in the sudo/wheel/admin groups themselves
     for g in grp.getgrall():
         if g.gr_name in SUDO_GROUPS:
             sudo_members.update(g.gr_mem)
 
-    # Plus any user whose primary group is one of these
+    # Plus any regular user (UID >= 501 on macOS, >= 1000 on Linux) with primary group in SUDO_GROUPS
+    # And always include root
+    MIN_UID = 501  # macOS convention
     for u in pwd.getpwall():
         try:
             gname = grp.getgrgid(u.pw_gid).gr_name
-            if gname in SUDO_GROUPS and u.pw_uid >= 1000 or u.pw_name == "root":
+            if (gname in SUDO_GROUPS and u.pw_uid >= MIN_UID) or u.pw_name == "root":
                 sudo_members.add(u.pw_name)
         except KeyError:
             pass
 
-    # Failed sudo attempts (last 7 days) from /var/log/auth.log
+    # Failed sudo attempts on macOS: use `log show` (unified logging) or check /var/log/system.log
+    # Note: /var/log/auth.log is Linux-specific; macOS uses unified logging
     failed_map: dict[str, int] = {}
-    for log_path in ("/var/log/auth.log", "/var/log/secure"):
-        if os.path.exists(log_path):
+    try:
+        # Query macOS unified log for failed sudo events (last 7 days)
+        result = subprocess.run(
+            ["log", "show", "--predicate", 'process == "sudo"',
+             "--last", "7d", "--style", "compact"],
+            capture_output=True, text=True, timeout=30,
+        )
+        for line in result.stdout.splitlines():
+            low = line.lower()
+            if ("authentication failure" in low or "incorrect password" in low) and "sudo" in low:
+                for tok in line.split():
+                    if "@" in tok or tok.endswith(":"):
+                        cand = tok.strip(":").split("@")[0].strip()
+                        if cand and not cand.startswith("/"):
+                            failed_map[cand] = failed_map.get(cand, 0) + 1
+                            break
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        # `log` command not available or denied — fallback to /var/log/system.log
+        if os.path.exists("/var/log/system.log"):
             try:
-                with open(log_path, "r", errors="ignore") as f:
+                with open("/var/log/system.log", "r", errors="ignore") as f:
                     for line in f:
-                        if "authentication failure" in line and "sudo" in line:
+                        if "authentication failure" in line.lower() and "sudo" in line.lower():
                             for tok in line.split():
                                 if tok.startswith("user="):
                                     u = tok.split("=", 1)[1].strip()
                                     failed_map[u] = failed_map.get(u, 0) + 1
             except (PermissionError, OSError):
                 pass
-            break
 
     for username in sudo_members:
         try:
@@ -142,8 +163,8 @@ def scan_sudoers(request: Request, db: Session = Depends(get_db),
     ))
     db.commit()
 
-    if platform.system() == "Linux":
-        found, duration = _enumerate_linux_sudo_users(db, current_user.username)
+    if platform.system() == "Darwin":
+        found, duration = _enumerate_macos_sudo_users(db, current_user.username)
     else:
         found, duration = _seed_demo_sudo(db)
 

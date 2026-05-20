@@ -10,7 +10,9 @@ Run with:
     gunicorn -c gunicorn.conf.py main:app
 """
 import os
+import platform
 import socket
+import sys
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +20,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from database import engine
 import models
 from routers import system, permission_audit, sudo_monitor, file_integrity, terminal
+
+# Startup sanity checks
+if platform.system() != "Darwin":
+    print(f"[WARN] agent-macos berjalan di {platform.system()} (bukan macOS). "
+          "Fitur seperti unified log query akan dinonaktifkan.")
+
+if not os.getenv("SECUREOPS_AGENT_KEY"):
+    print("[WARN] SECUREOPS_AGENT_KEY tidak di-set — semua endpoint akan return 401")
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -47,8 +57,14 @@ def health():
     return {
         "status":   "ok",
         "service":  "SecureOps Agent (macOS)",
-        "version":  "1.3.0",
+        "version":  "1.5.0",
         "mode":     "agent",
         "platform": "macos",
         "hostname": socket.gethostname(),
+        "os":       platform.platform(),
+        "python":   sys.version.split()[0],
+        "features": {
+            "terminal":  True,  # macOS punya /dev/pty seperti Linux
+            "recording": os.getenv("SECUREOPS_RECORD_SESSIONS", "0") == "1",
+        },
     }

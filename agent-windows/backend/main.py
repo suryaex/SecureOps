@@ -9,6 +9,7 @@ Run with:
     uvicorn main:app --host 0.0.0.0 --port 8001
 or via NSSM as a Windows Service.
 """
+import os
 import socket
 import platform
 import sys
@@ -17,6 +18,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from routers import system, permission_audit, user_monitor, file_integrity, terminal
+
+# Startup sanity checks
+if platform.system() != "Windows":
+    print(f"[WARN] agent-windows berjalan di {platform.system()} (bukan Windows). "
+          "Fitur OS-specific seperti ConPTY terminal akan dinonaktifkan.")
+
+if not os.getenv("SECUREOPS_AGENT_KEY"):
+    print("[WARN] SECUREOPS_AGENT_KEY tidak di-set — semua endpoint akan return 401")
 
 app = FastAPI(
     title="SecureOps Agent (Windows)",
@@ -41,6 +50,13 @@ app.include_router(terminal.router,         prefix="/api/terminal",         tags
 
 @app.get("/api/health")
 def health():
+    # Cek apakah pywinpty terinstal (untuk fitur terminal)
+    try:
+        import winpty
+        terminal_ok = True
+    except ImportError:
+        terminal_ok = False
+
     return {
         "status":     "ok",
         "service":    "SecureOps Agent",
@@ -50,4 +66,8 @@ def health():
         "hostname":   socket.gethostname(),
         "os":         platform.platform(),
         "python":     sys.version.split()[0],
+        "features": {
+            "terminal": terminal_ok,
+            "recording": os.getenv("SECUREOPS_RECORD_SESSIONS", "0") == "1",
+        },
     }

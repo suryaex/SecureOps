@@ -108,8 +108,9 @@ def run_scan(
     db.add(log)
     db.commit()
 
-    if platform.system() == "Linux":
-        total, found, duration = _scan_linux("/var", current_user.username, db)
+    # macOS Darwin scans /etc + /Applications + /Library (Mac equivalents of Linux /var)
+    if platform.system() == "Darwin":
+        total, found, duration = _scan_linux("/etc", current_user.username, db)
     else:
         total, found, duration = _seed_demo_data(current_user.username, db)
 

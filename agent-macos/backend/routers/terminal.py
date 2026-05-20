@@ -55,10 +55,12 @@ def _shell_argv() -> list[str]:
     """Decide which command to exec inside the PTY."""
     if SHELL_CMD:
         return shlex.split(SHELL_CMD)
+    # macOS default shell sejak Catalina (10.15) adalah zsh
+    default_shell = "/bin/zsh" if os.path.exists("/bin/zsh") else "/bin/bash"
     if SHELL_USER:
-        # Drop to a real OS user — preserves their UID, GID, env, $HOME
-        return ["/bin/su", "-s", "/bin/bash", "-l", SHELL_USER]
-    return ["/bin/bash", "--login"]
+        # macOS `su -l` honors user's login shell preference
+        return ["/usr/bin/su", "-l", SHELL_USER]
+    return [default_shell, "-l"]
 
 
 def _set_winsize(fd: int, cols: int, rows: int) -> None:
