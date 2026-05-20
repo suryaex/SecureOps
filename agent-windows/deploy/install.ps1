@@ -272,20 +272,54 @@ if (-not (Test-Path $NssmExe)) {
 }
 
 # ============================== INSTALL SERVICE ==============================
-Say "Installing Windows Service: $ServiceName..."
-$existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-if ($existingService) {
-    & $NssmExe stop $ServiceName 2>$null | Out-Null
-    & $NssmExe remove $ServiceName confirm | Out-Null
+#
+# Helper untuk menjalankan native command dan TELAN error sambil tetap track
+# exit code. Tanpa ini, native command (NSSM, sc.exe) yang tulis ke stderr akan
+# trigger PowerShell RemoteException dan terminate script ($ErrorActionPreference=Stop).
+function Invoke-Native {
+    param([string]$Exe, [string[]]$Arguments)
+    try {
+        # Redirect stderr ke stdout, capture semua output, jangan biarkan exception
+        $output = & $Exe @Arguments 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+        return @{ Output = $output; ExitCode = $exitCode; Success = ($exitCode -eq 0) }
+    } catch {
+        return @{ Output = $_.Exception.Message; ExitCode = -1; Success = $false }
+    }
 }
 
-$uvicornExe = "$VenvDir\Scripts\uvicorn.exe"
-$svcArgs = "main:app --host 0.0.0.0 --port $Port"
-& $NssmExe install $ServiceName $uvicornExe $svcArgs
-& $NssmExe set $ServiceName AppDirectory $BackendDir
-& $NssmExe set $ServiceName DisplayName "SecureOps Agent"
-& $NssmExe set $ServiceName Description "SecureOps Agent - Centralized security monitoring"
-& $NssmExe set $ServiceName Start SERVICE_AUTO_START
+Say "Installing Windows Service: $ServiceName..."
+
+# Stop & remove kalau service existing (dengan tolerance kalau gak ada)
+$existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+if ($existingService) {
+    Info "Existing service found - stopping and removing..."
+    Invoke-Native $NssmExe @("stop", $ServiceName) | Out-Null
+    Invoke-Native $NssmExe @("remove", $ServiceName, "confirm") | Out-Null
+    Start-Sleep -Seconds 2
+}
+
+$uvicornExe = Join-Path $VenvDir "Scripts\uvicorn.exe"
+$svcArgs    = "main:app --host 0.0.0.0 --port $Port"
+
+# Install service
+$r = Invoke-Native $NssmExe @("install", $ServiceName, $uvicornExe, $svcArgs)
+if (-not $r.Success) { Die "NSSM install failed: $($r.Output)" }
+
+# Configure service (semua dengan tolerance — kalau salah satu fail, log saja)
+$nssmConfig = @(
+    @("set", $ServiceName, "AppDirectory", $BackendDir),
+    @("set", $ServiceName, "DisplayName", "SecureOps Agent"),
+    @("set", $ServiceName, "Description", "SecureOps Agent - Centralized security monitoring"),
+    @("set", $ServiceName, "Start", "SERVICE_AUTO_START")
+)
+
+foreach ($cfg in $nssmConfig) {
+    $r = Invoke-Native $NssmExe $cfg
+    if (-not $r.Success) {
+        Warn "NSSM config '$($cfg[2])' returned $($r.ExitCode): $($r.Output.Trim())"
+    }
+}
 
 # Environment variables for the service
 $nl = [Environment]::NewLine
@@ -294,30 +328,49 @@ $envBlock = "SECUREOPS_AGENT_KEY=$AgentKey" + $nl +
             "SECUREOPS_RECORD_DIR=$ConfigDir\sessions" + $nl +
             "PYTHONUNBUFFERED=1" + $nl +
             "PYTHONIOENCODING=utf-8"
-& $NssmExe set $ServiceName AppEnvironmentExtra $envBlock
+Invoke-Native $NssmExe @("set", $ServiceName, "AppEnvironmentExtra", $envBlock) | Out-Null
 
 # Logs
-$stdoutLog = "$ConfigDir\service-stdout.log"
-$stderrLog = "$ConfigDir\service-stderr.log"
-& $NssmExe set $ServiceName AppStdout $stdoutLog
-& $NssmExe set $ServiceName AppStderr $stderrLog
-& $NssmExe set $ServiceName AppRotateFiles 1
-& $NssmExe set $ServiceName AppRotateBytes 10485760
-
-# Restart on failure
-& $NssmExe set $ServiceName AppExit Default Restart
-& $NssmExe set $ServiceName AppRestartDelay 5000
+$stdoutLog = Join-Path $ConfigDir "service-stdout.log"
+$stderrLog = Join-Path $ConfigDir "service-stderr.log"
+$logConfig = @(
+    @("set", $ServiceName, "AppStdout", $stdoutLog),
+    @("set", $ServiceName, "AppStderr", $stderrLog),
+    @("set", $ServiceName, "AppRotateFiles", "1"),
+    @("set", $ServiceName, "AppRotateBytes", "10485760"),
+    @("set", $ServiceName, "AppExit", "Default", "Restart"),
+    @("set", $ServiceName, "AppRestartDelay", "5000")
+)
+foreach ($cfg in $logConfig) {
+    Invoke-Native $NssmExe $cfg | Out-Null
+}
 
 # ============================== FIREWALL ==============================
 Say "Adding Windows Firewall rule for port $Port..."
 $ruleName = "SecureOps-Agent Port $Port"
-Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
-New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow -Profile Domain,Private -Description "SecureOps Agent HTTP API" | Out-Null
+try {
+    Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+    New-NetFirewallRule -DisplayName $ruleName `
+        -Direction Inbound -Protocol TCP -LocalPort $Port `
+        -Action Allow -Profile Domain,Private,Public `
+        -Description "SecureOps Agent HTTP API" -ErrorAction Stop | Out-Null
+    Info "Firewall rule added"
+} catch {
+    Warn "Failed to add firewall rule: $($_.Exception.Message)"
+    Warn "Manual: New-NetFirewallRule -DisplayName '$ruleName' -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow"
+}
 
 # ============================== START SERVICE ==============================
 Say "Starting service..."
-Start-Service -Name $ServiceName
-Start-Sleep -Seconds 3
+try {
+    Start-Service -Name $ServiceName -ErrorAction Stop
+    Start-Sleep -Seconds 3
+} catch {
+    Warn "Start-Service failed: $($_.Exception.Message)"
+    Warn "Trying NSSM start instead..."
+    Invoke-Native $NssmExe @("start", $ServiceName) | Out-Null
+    Start-Sleep -Seconds 3
+}
 
 # Wait for service to become healthy
 Say "Waiting for agent to become healthy..."
