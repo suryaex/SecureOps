@@ -1,173 +1,132 @@
 # SecureOps Agent - Windows Installer
-#
-# Usage (PowerShell as Administrator):
-#   $env:SECUREOPS_AGENT_KEY = "<paste-key-from-controller-UI>"
-#   iwr "https://secureops.site/api/servers/install-script/<token>?os=windows" -UseBasicParsing | iex
-#
-# Or download then run:
-#   iwr "https://raw.githubusercontent.com/suryaex/secureops/main/agent-windows/deploy/install.ps1" -OutFile install.ps1
-#   .\install.ps1
-#
-# Supported OS: Windows 10 (1809+), Windows 11, Windows Server 2019/2022
+# Supports: Windows 10 (1809+), Windows 11, Windows Server 2019/2022
+# Runs cleanly via `iwr ... | iex` OR `.\install.ps1` standalone.
 
-# Note: Admin check happens in the bootstrap prefix from controller.
-# When running install.ps1 standalone, uncomment this:
-# #Requires -RunAsAdministrator
-$ErrorActionPreference = "Stop"
+# CRITICAL: don't use 'Stop' globally - native commands (nssm) write to stderr
+# routinely and we don't want to terminate on warnings. Use try/catch per-call.
+$ErrorActionPreference = 'Continue'
 
 # ============================== CONFIG ==============================
 $InstallDir    = "C:\Program Files\SecureOps-Agent"
 $ServiceName   = "SecureOps-Agent"
-$Port          = if ($env:SECUREOPS_AGENT_PORT) { $env:SECUREOPS_AGENT_PORT } else { 8001 }
+$Port          = if ($env:SECUREOPS_AGENT_PORT)         { $env:SECUREOPS_AGENT_PORT }         else { "8001" }
+$RecordSess    = if ($env:SECUREOPS_RECORD_SESSIONS)    { $env:SECUREOPS_RECORD_SESSIONS }    else { "0" }
 $AgentKey      = $env:SECUREOPS_AGENT_KEY
 $JoinToken     = $env:SECUREOPS_JOIN_TOKEN
 $ControllerURL = $env:SECUREOPS_CONTROLLER_URL
-$RecordSess    = if ($env:SECUREOPS_RECORD_SESSIONS) { $env:SECUREOPS_RECORD_SESSIONS } else { "0" }
 $RepoURL       = "https://github.com/suryaex/secureops.git"
-$ConfigDir     = "$env:PROGRAMDATA\SecureOps-Agent"
+
+# ConfigDir: prefer PROGRAMDATA, fallback ke C:\ProgramData
+$pgmData = $env:PROGRAMDATA
+if ([string]::IsNullOrWhiteSpace($pgmData)) { $pgmData = "C:\ProgramData" }
+$ConfigDir = Join-Path $pgmData "SecureOps-Agent"
 
 # ============================== HELPERS ==============================
 function Say  { param($msg) Write-Host "==> $msg" -ForegroundColor Green }
 function Info { param($msg) Write-Host "  $msg" -ForegroundColor Cyan }
-function Warn { param($msg) Write-Host "[WARN] $msg" -ForegroundColor Yellow }
-function Die  { param($msg) Write-Host "[ERROR] $msg" -ForegroundColor Red; exit 1 }
+function Warn { param($msg) Write-Host "!!  $msg" -ForegroundColor Yellow }
+function Die  { param($msg) Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
 
-# ============================== OS CHECK ==============================
-$os = Get-CimInstance Win32_OperatingSystem
-Say "Detected: $($os.Caption) build $($os.BuildNumber)"
-
-if ([int]$os.BuildNumber -lt 17763) {
-    Die "Windows 10 build 1809+ or Windows Server 2019+ required for ConPTY support"
+# Wrap native commands so stderr doesn't crash the script.
+function Invoke-Native {
+    param([string]$Exe, [string[]]$Arguments)
+    try {
+        $output = & $Exe @Arguments 2>&1 | Out-String
+        return @{ Output = $output; ExitCode = $LASTEXITCODE; Success = ($LASTEXITCODE -eq 0) }
+    } catch {
+        return @{ Output = $_.Exception.Message; ExitCode = -1; Success = $false }
+    }
 }
 
-# Auto-generate key if not set
-if (-not $AgentKey) {
-    Add-Type -AssemblyName System.Web
-    $AgentKey = [System.Web.Security.Membership]::GeneratePassword(43, 8)
+# ============================== ADMIN CHECK ==============================
+$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Die "Must run as Administrator. Right-click PowerShell -> Run as Administrator."
+}
+
+# ============================== OS CHECK ==============================
+try {
+    $os = Get-CimInstance Win32_OperatingSystem
+    Say "Detected: $($os.Caption) build $($os.BuildNumber)"
+    if ([int]$os.BuildNumber -lt 17763) {
+        Die "Need Windows 10 build 1809+ or Server 2019+"
+    }
+} catch {
+    Warn "Could not detect OS version: $($_.Exception.Message)"
+}
+
+# ============================== AGENT KEY ==============================
+if ([string]::IsNullOrWhiteSpace($AgentKey)) {
+    Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
+    try {
+        $AgentKey = [System.Web.Security.Membership]::GeneratePassword(43, 8)
+    } catch {
+        # Fallback if System.Web not available
+        $AgentKey = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 43 | ForEach-Object { [char]$_ })
+    }
     Warn "SECUREOPS_AGENT_KEY not set - auto-generated"
 }
 
 # ============================== PYTHON ==============================
-# Cari Python 3.10-3.13 (paling stabil + semua wheel tersedia).
-# Hindari Python 3.14+ karena banyak package belum punya pre-built wheel.
-# Semua operasi di-wrap try/catch supaya stderr dari py.exe gak terminate script.
-
-$PreferredPyVersions = @("3.13", "3.12", "3.11", "3.10")
+# Cari Python 3.12 atau 3.13. Skip 3.14+ karena banyak wheel belum tersedia.
+$PreferredPyVersions = @("3.12", "3.13")
 $PythonExe = $null
 
-function Test-PythonExe([string]$ExePath) {
-    if (-not (Test-Path $ExePath)) { return $null }
-    try {
-        $ver = & $ExePath -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>&1
-        if ($LASTEXITCODE -eq 0 -and $ver -match "^3\.(10|11|12|13)$") {
-            return $ver.Trim()
-        }
-    } catch {}
-    return $null
-}
-
-# Cara 1: Cek path standard tempat installer Python masuk
-$standardPaths = @(
-    "C:\Python313\python.exe",
-    "C:\Python312\python.exe",
-    "C:\Python311\python.exe",
-    "C:\Python310\python.exe",
-    "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",
-    "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
-    "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
-    "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
-)
-foreach ($p in $standardPaths) {
-    $ver = Test-PythonExe $p
-    if ($ver) {
-        $PythonExe = $p
-        Info "Found Python $ver at $p"
-        break
-    }
-}
-
-# Cara 2: py launcher with --list (cek apa yang ter-install)
-if (-not $PythonExe) {
-    try {
-        $pyAvailable = @()
-        # py --list selalu sukses kalau py launcher ada; output ke stderr
-        $listRaw = (& py --list 2>&1) -join "`n"
-        foreach ($line in $listRaw -split "`r?`n") {
-            if ($line -match "-V:(\d+\.\d+)") {
-                $pyAvailable += $matches[1]
-            }
-        }
-        Info "py launcher Pythons: $($pyAvailable -join ', ')"
-
-        foreach ($v in $PreferredPyVersions) {
-            if ($pyAvailable -contains $v) {
-                $candidate = (& py "-$v" -c "import sys; print(sys.executable)" 2>&1).Trim()
-                if ((Test-PythonExe $candidate)) {
-                    $PythonExe = $candidate
-                    Info "Found via py launcher: Python $v at $candidate"
+# Cara 1: py launcher
+$pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+if ($pyLauncher) {
+    foreach ($v in $PreferredPyVersions) {
+        try {
+            $check = & py "-$v" --version 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                $PythonExe = (& py "-$v" -c "import sys; print(sys.executable)" 2>$null).Trim()
+                if (-not [string]::IsNullOrWhiteSpace($PythonExe)) {
+                    Info "Found via py launcher: $check ($PythonExe)"
                     break
                 }
             }
-        }
-    } catch {
-        # py launcher gagal — skip ke cara 3
+        } catch {}
     }
 }
 
-# Cara 3: direct python.exe di PATH (cek versinya)
-if (-not $PythonExe) {
-    try {
-        $directPy = (Get-Command python -ErrorAction Stop).Source
-        $ver = Test-PythonExe $directPy
-        if ($ver) {
-            $PythonExe = $directPy
-            Info "Found python.exe in PATH: Python $ver at $directPy"
-        } else {
-            Warn "python.exe found but version not compatible (need 3.10-3.13). Will install Python 3.12."
-        }
-    } catch {
-        # python.exe tidak di PATH
+# Cara 2: python.exe direct (cek versinya 3.10-3.13)
+if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+    $directPy = Get-Command python -ErrorAction SilentlyContinue
+    if ($directPy) {
+        try {
+            $verStr = & python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
+            if ($verStr -and $verStr -match "^3\.(10|11|12|13)$") {
+                $PythonExe = $directPy.Source
+                Info "Found Python: $verStr ($PythonExe)"
+            }
+        } catch {}
     }
 }
 
-# Cara 4: install Python 3.12 manual
-if (-not $PythonExe) {
-    Say "Compatible Python (3.10-3.13) tidak ditemukan - installing Python 3.12.7..."
-    $pyInstaller = Join-Path $env:TEMP "python-3.12.7-installer.exe"
+# Cara 3: install Python 3.12 baru
+if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+    Say "Python 3.10-3.13 not found - installing Python 3.12.7..."
+    $pyInstaller = Join-Path $env:TEMP "python-3.12.7.exe"
     try {
         Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe" `
-                          -OutFile $pyInstaller -UseBasicParsing -TimeoutSec 120
+                          -OutFile $pyInstaller -UseBasicParsing -ErrorAction Stop
     } catch {
-        Die "Gagal download Python 3.12.7 installer: $_"
+        Die "Failed to download Python 3.12.7: $($_.Exception.Message)"
     }
-
-    Say "Running Python installer (silent, all users, +PATH, +launcher)..."
-    # InstallAllUsers=1 → C:\Python312 (system-wide)
-    # PrependPath=1     → add to PATH
-    # Include_launcher=1 → register py launcher
-    # Include_test=0    → skip test suite (smaller)
-    $proc = Start-Process $pyInstaller -Wait -PassThru -ArgumentList @(
-        "/quiet", "InstallAllUsers=1", "PrependPath=1",
-        "Include_launcher=1", "Include_test=0", "SimpleInstall=1"
-    )
+    Start-Process $pyInstaller -Wait -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_launcher=1"
     Remove-Item $pyInstaller -Force -ErrorAction SilentlyContinue
-
-    if ($proc.ExitCode -ne 0) {
-        Die "Python 3.12.7 installer exited dengan code $($proc.ExitCode). Install manually dari https://www.python.org/downloads/release/python-3127/"
-    }
-
-    # Refresh PATH dalam current PowerShell session
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+    # Refresh PATH
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + `
                 [System.Environment]::GetEnvironmentVariable("Path", "User")
-
-    # Cek apakah Python 3.12 sekarang ada
-    $candidate = "C:\Python312\python.exe"
-    $ver = Test-PythonExe $candidate
-    if ($ver) {
-        $PythonExe = $candidate
-        Info "Successfully installed Python $ver at $candidate"
-    } else {
-        Die "Python 3.12 ke-install tapi C:\Python312\python.exe tidak ditemukan. Coba restart PowerShell dan jalankan installer lagi."
+    # Try lagi
+    try {
+        $check = & py "-3.12" --version 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $PythonExe = (& py "-3.12" -c "import sys; print(sys.executable)" 2>$null).Trim()
+        }
+    } catch {}
+    if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+        Die "Python 3.12 installation failed."
     }
 }
 
@@ -177,271 +136,230 @@ Info "Will use Python: $PythonExe"
 $git = Get-Command git -ErrorAction SilentlyContinue
 if (-not $git) {
     Say "Git not found - installing Git for Windows..."
-    $gitInstaller = "$env:TEMP\git-installer.exe"
-    Invoke-WebRequest -Uri "https://github.com/git-for-windows/git/releases/download/v2.46.0.windows.1/Git-2.46.0-64-bit.exe" -OutFile $gitInstaller -UseBasicParsing
-    Start-Process $gitInstaller -Wait -ArgumentList "/VERYSILENT /NORESTART"
-    Remove-Item $gitInstaller -Force
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    $gitInstaller = Join-Path $env:TEMP "git-installer.exe"
+    try {
+        Invoke-WebRequest -Uri "https://github.com/git-for-windows/git/releases/download/v2.46.0.windows.1/Git-2.46.0-64-bit.exe" `
+                          -OutFile $gitInstaller -UseBasicParsing -ErrorAction Stop
+        Start-Process $gitInstaller -Wait -ArgumentList "/VERYSILENT /NORESTART"
+        Remove-Item $gitInstaller -Force -ErrorAction SilentlyContinue
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    } catch {
+        Die "Failed to install Git: $($_.Exception.Message)"
+    }
 }
 
 # ============================== CLONE/PULL REPO ==============================
-if (Test-Path "$InstallDir\.git") {
+if (Test-Path (Join-Path $InstallDir ".git")) {
     Say "Updating existing install at $InstallDir..."
-    git -C $InstallDir pull --ff-only
+    Invoke-Native "git" @("-C", $InstallDir, "pull", "--ff-only") | Out-Null
 } else {
     Say "Cloning repo to $InstallDir..."
-    if (Test-Path $InstallDir) { Remove-Item $InstallDir -Recurse -Force }
-    git clone --depth 1 $RepoURL $InstallDir
+    if (Test-Path $InstallDir) {
+        Remove-Item $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $r = Invoke-Native "git" @("clone", "--depth", "1", $RepoURL, $InstallDir)
+    if (-not $r.Success) { Die "git clone failed: $($r.Output)" }
 }
 
 # ============================== PYTHON VENV ==============================
-$BackendDir = "$InstallDir\agent-windows\backend"
-$VenvDir    = "$BackendDir\venv"
+$BackendDir = Join-Path $InstallDir "agent-windows\backend"
+$VenvDir    = Join-Path $BackendDir "venv"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 $VenvPip    = Join-Path $VenvDir "Scripts\pip.exe"
 
-# Buang venv lama kalau ada (mungkin dari Python version berbeda)
 if (Test-Path $VenvDir) {
     Say "Removing existing venv..."
-    Remove-Item $VenvDir -Recurse -Force
+    Remove-Item $VenvDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Say "Setting up Python venv with $PythonExe..."
-& $PythonExe -m venv $VenvDir
+$r = Invoke-Native $PythonExe @("-m", "venv", $VenvDir)
 if (-not (Test-Path $VenvPython)) {
-    Die "Failed to create venv. Python at $PythonExe may be broken."
+    Die "venv creation failed: $($r.Output)"
 }
 
-# Verifikasi venv pakai Python yang benar
-$venvVer = & $VenvPython -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-Info "Venv Python: $venvVer"
-
-Say "Installing core dependencies (fastapi, uvicorn, psutil, websockets, etc.)..."
-& $VenvPython -m pip install --quiet --upgrade pip setuptools wheel
-& $VenvPip install --quiet -r "$BackendDir\requirements.txt"
-if ($LASTEXITCODE -ne 0) {
-    Die "Failed to install core Python dependencies. Check Python version + internet connection."
-}
-
-# pywinpty di-install TERPISAH (optional, hanya untuk fitur terminal).
-# Bisa gagal di Python 3.14+ karena belum ada wheel — di-handle gracefully.
-Say "Installing pywinpty for terminal feature (optional)..."
-$pywinptyOK = $false
 try {
-    & $VenvPip install --quiet pywinpty 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        $pywinptyOK = $true
-        Info "pywinpty installed - terminal feature enabled"
-    }
+    $venvVer = & $VenvPython -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
+    Info "Venv Python: $venvVer"
 } catch {}
 
-if (-not $pywinptyOK) {
-    Warn "pywinpty install failed - terminal feature will be DISABLED"
+Say "Installing core dependencies (fastapi, uvicorn, psutil, websockets, etc.)..."
+Invoke-Native $VenvPython @("-m", "pip", "install", "--quiet", "--upgrade", "pip", "setuptools", "wheel") | Out-Null
+$r = Invoke-Native $VenvPip @("install", "--quiet", "-r", (Join-Path $BackendDir "requirements.txt"))
+if (-not $r.Success) {
+    Die "Failed to install core dependencies. Check Python + internet. Output: $($r.Output)"
+}
+
+# pywinpty optional - kalau gagal, terminal feature disabled tapi sisanya jalan.
+Say "Installing pywinpty for terminal feature (optional)..."
+$pywinptyOK = $false
+$r = Invoke-Native $VenvPip @("install", "--quiet", "pywinpty")
+if ($r.Success) {
+    $pywinptyOK = $true
+    Info "pywinpty installed - terminal feature enabled"
+} else {
+    Warn "pywinpty install failed - terminal feature DISABLED"
     Warn "Common cause: Python 3.14 has no pre-built wheel yet."
     Warn "Other features (system health, audit, sudo, FIM) tetap berfungsi."
-    Warn "Untuk enable terminal nanti:"
-    Warn "  1. Install Visual Studio Build Tools dengan C++ workload"
-    Warn "  2. Jalankan: $VenvPip install pywinpty"
 }
 
 # ============================== SAVE KEY ==============================
-New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null
-Set-Content -Path "$ConfigDir\key" -Value $AgentKey -Encoding UTF8 -NoNewline
+New-Item -ItemType Directory -Path $ConfigDir -Force -ErrorAction SilentlyContinue | Out-Null
+$KeyFile = Join-Path $ConfigDir "key"
+Set-Content -LiteralPath $KeyFile -Value $AgentKey -Encoding UTF8 -NoNewline
 
-$acl = Get-Acl "$ConfigDir\key"
-$acl.SetAccessRuleProtection($true, $false)
-$adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators", "FullControl", "Allow")
-$acl.AddAccessRule($adminRule)
-Set-Acl "$ConfigDir\key" $acl
+# ACL hardening optional - kalau gagal skip aja (file tetap protected by NTFS default)
+try {
+    $acl = Get-Acl -LiteralPath $KeyFile
+    $acl.SetAccessRuleProtection($true, $false)
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        "BUILTIN\Administrators", "FullControl", "Allow")
+    $acl.AddAccessRule($rule)
+    Set-Acl -LiteralPath $KeyFile -AclObject $acl
+} catch {
+    Warn "Could not harden ACL on key file (non-fatal): $($_.Exception.Message)"
+}
 
-# ============================== DOWNLOAD NSSM ==============================
-# NSSM (Non-Sucking Service Manager) untuk wrap uvicorn jadi Windows Service.
-# Server nssm.cc kadang 503 — pakai multiple mirrors dengan retry.
+# ============================== NSSM ==============================
 $NssmDir = Join-Path $InstallDir "nssm"
 $NssmExe = Join-Path $NssmDir "win64\nssm.exe"
 
+# Cek bundled NSSM dari repo dulu (kalau ada)
 if (-not (Test-Path $NssmExe)) {
-    # Cara 1: Cek apakah ada nssm.exe yang sudah di-bundle di repo
-    $BundledNssm = Join-Path (Split-Path $PSCommandPath) "bundled\nssm.exe"
-    if (Test-Path $BundledNssm) {
-        Say "Using bundled NSSM from $BundledNssm..."
-        New-Item -ItemType Directory -Path (Split-Path $NssmExe) -Force | Out-Null
-        Copy-Item $BundledNssm $NssmExe -Force
+    $bundledPath = Join-Path $InstallDir "agent-windows\deploy\bundled\nssm.exe"
+    if (Test-Path $bundledPath) {
+        Say "Using bundled NSSM from $bundledPath..."
+        $win64Dir = Join-Path $NssmDir "win64"
+        New-Item -ItemType Directory -Path $win64Dir -Force -ErrorAction SilentlyContinue | Out-Null
+        Copy-Item -LiteralPath $bundledPath -Destination $NssmExe -Force
         Info "NSSM ready (bundled)"
     }
 }
 
+# Kalau bundled gak ada, download dari mirror
 if (-not (Test-Path $NssmExe)) {
     Say "Downloading NSSM (service manager)..."
-
-    # Multiple mirror URLs untuk tahan banting kalau primary down.
-    # GitHub-hosted mirrors lebih reliable daripada nssm.cc.
     $NssmMirrors = @(
-        "https://github.com/suryaex/secureops/releases/download/nssm-2.24/nssm-2.24.zip",  # repo release (paling reliable)
-        "https://nssm.cc/release/nssm-2.24.zip",                                            # canonical
-        "https://nssm.cc/ci/nssm-2.24-101-g897c7ad.zip",                                    # canonical CI build
-        "https://web.archive.org/web/2024*/https://nssm.cc/release/nssm-2.24.zip"           # Wayback Machine
+        "https://github.com/suryaex/secureops/releases/download/nssm-2.24/nssm-2.24.zip",
+        "https://nssm.cc/release/nssm-2.24.zip",
+        "https://nssm.cc/ci/nssm-2.24-101-g897c7ad.zip"
     )
-
     $nssmZip = Join-Path $env:TEMP "nssm.zip"
     $downloaded = $false
 
     foreach ($url in $NssmMirrors) {
-        for ($attempt = 1; $attempt -le 3; $attempt++) {
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
             try {
-                Info "Mirror: $url (attempt $attempt/3)"
+                Info "Mirror: $url (attempt $attempt/2)"
                 Invoke-WebRequest -Uri $url -OutFile $nssmZip -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
-                if ((Get-Item $nssmZip).Length -gt 100000) {
-                    # NSSM zip should be ~330KB; if smaller, probably error page
+                $size = (Get-Item -LiteralPath $nssmZip -ErrorAction SilentlyContinue).Length
+                if ($size -and $size -gt 100000) {
                     $downloaded = $true
-                    Info "NSSM downloaded successfully ($('{0:N0}' -f (Get-Item $nssmZip).Length) bytes)"
+                    Info "NSSM downloaded ($size bytes)"
                     break
                 } else {
-                    Warn "Downloaded file too small, likely an error page. Trying next."
-                    Remove-Item $nssmZip -Force -ErrorAction SilentlyContinue
+                    Warn "Downloaded file too small, retrying..."
+                    Remove-Item -LiteralPath $nssmZip -Force -ErrorAction SilentlyContinue
                 }
             } catch {
-                Warn "Failed: $($_.Exception.Message)"
-                Start-Sleep -Seconds (2 * $attempt)
+                Warn "Mirror failed: $($_.Exception.Message)"
+                Start-Sleep -Seconds 2
             }
         }
         if ($downloaded) { break }
     }
 
     if (-not $downloaded) {
-        # Final fallback: cek apakah ada nssm.exe di system PATH (mungkin user install via Chocolatey/Scoop)
+        # Fallback: system-wide nssm (e.g. dari Chocolatey)
         $sysNssm = Get-Command nssm -ErrorAction SilentlyContinue
         if ($sysNssm) {
             Info "Using system-installed NSSM at $($sysNssm.Source)"
-            New-Item -ItemType Directory -Path (Split-Path $NssmExe) -Force | Out-Null
-            Copy-Item $sysNssm.Source $NssmExe -Force
-            $downloaded = $true
-        }
-    }
-
-    if (-not $downloaded) {
-        Write-Host ""
-        Write-Host "==========================================================" -ForegroundColor Red
-        Write-Host "  NSSM DOWNLOAD FAILED" -ForegroundColor Red
-        Write-Host "==========================================================" -ForegroundColor Red
-        Write-Host ""
-        Write-Host "Server NSSM (nssm.cc) sedang tidak responsif." -ForegroundColor Yellow
-        Write-Host ""
-        Write-Host "OPSI 1 - Install NSSM via Chocolatey:" -ForegroundColor Cyan
-        Write-Host "  Set-ExecutionPolicy Bypass -Scope Process -Force" -ForegroundColor White
-        Write-Host "  iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))" -ForegroundColor White
-        Write-Host "  choco install nssm -y" -ForegroundColor White
-        Write-Host "  # Lalu jalankan ulang installer SecureOps" -ForegroundColor White
-        Write-Host ""
-        Write-Host "OPSI 2 - Manual download:" -ForegroundColor Cyan
-        Write-Host "  1. Coba lagi nanti, atau download dari mirror lain"
-        Write-Host "  2. Extract zip-nya ke: $NssmDir"
-        Write-Host "  3. Pastikan ada file: $NssmExe"
-        Write-Host "  4. Jalankan ulang installer ini"
-        Write-Host ""
-        Die "Cannot proceed without NSSM."
-    }
-
-    # Extract zip
-    try {
-        Expand-Archive -Path $nssmZip -DestinationPath $NssmDir -Force -ErrorAction Stop
-    } catch {
-        Die "Failed to extract NSSM zip: $($_.Exception.Message)"
-    }
-
-    # Normalisasi struktur folder ke $NssmDir/win64/nssm.exe
-    if (-not (Test-Path $NssmExe)) {
-        # Cari nssm.exe yang ter-extract (mungkin di subfolder)
-        $found = Get-ChildItem $NssmDir -Recurse -Filter "nssm.exe" | Where-Object {
-            $_.Directory.Name -eq "win64"
-        } | Select-Object -First 1
-        if ($found) {
             $win64Dir = Join-Path $NssmDir "win64"
-            New-Item -ItemType Directory -Path $win64Dir -Force | Out-Null
-            Copy-Item $found.FullName $NssmExe -Force
+            New-Item -ItemType Directory -Path $win64Dir -Force -ErrorAction SilentlyContinue | Out-Null
+            Copy-Item -LiteralPath $sysNssm.Source -Destination $NssmExe -Force
+        } else {
+            Write-Host ""
+            Write-Host "Cannot download NSSM. Workaround:" -ForegroundColor Yellow
+            Write-Host "  1. Install Chocolatey: https://chocolatey.org/install"
+            Write-Host "  2. choco install nssm -y"
+            Write-Host "  3. Re-run this installer"
+            Die "NSSM download failed from all mirrors."
         }
-    }
+    } else {
+        # Extract zip
+        try {
+            Expand-Archive -LiteralPath $nssmZip -DestinationPath $NssmDir -Force -ErrorAction Stop
+            # Cari nssm.exe yg di-extract dan move ke $NssmExe
+            if (-not (Test-Path $NssmExe)) {
+                $found = Get-ChildItem -LiteralPath $NssmDir -Recurse -Filter "nssm.exe" -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Directory.Name -eq "win64" } | Select-Object -First 1
+                if ($found) {
+                    $win64Dir = Join-Path $NssmDir "win64"
+                    New-Item -ItemType Directory -Path $win64Dir -Force -ErrorAction SilentlyContinue | Out-Null
+                    Copy-Item -LiteralPath $found.FullName -Destination $NssmExe -Force
+                }
+            }
+            Remove-Item -LiteralPath $nssmZip -Force -ErrorAction SilentlyContinue
+        } catch {
+            Die "Failed to extract NSSM zip: $($_.Exception.Message)"
+        }
 
-    if (-not (Test-Path $NssmExe)) {
-        Die "NSSM extracted but nssm.exe tidak ditemukan di $NssmExe"
+        if (-not (Test-Path $NssmExe)) {
+            Die "NSSM extracted but nssm.exe tidak ditemukan di expected path."
+        }
+        Info "NSSM ready at $NssmExe"
     }
-
-    Remove-Item $nssmZip -Force -ErrorAction SilentlyContinue
-    Info "NSSM ready at $NssmExe"
 }
 
 # ============================== INSTALL SERVICE ==============================
-#
-# Helper untuk menjalankan native command dan TELAN error sambil tetap track
-# exit code. Tanpa ini, native command (NSSM, sc.exe) yang tulis ke stderr akan
-# trigger PowerShell RemoteException dan terminate script ($ErrorActionPreference=Stop).
-function Invoke-Native {
-    param([string]$Exe, [string[]]$Arguments)
-    try {
-        # Redirect stderr ke stdout, capture semua output, jangan biarkan exception
-        $output = & $Exe @Arguments 2>&1 | Out-String
-        $exitCode = $LASTEXITCODE
-        return @{ Output = $output; ExitCode = $exitCode; Success = ($exitCode -eq 0) }
-    } catch {
-        return @{ Output = $_.Exception.Message; ExitCode = -1; Success = $false }
-    }
-}
-
 Say "Installing Windows Service: $ServiceName..."
 
-# Stop & remove kalau service existing (dengan tolerance kalau gak ada)
+# Stop & remove existing (with tolerance)
 $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($existingService) {
     Info "Existing service found - stopping and removing..."
     Invoke-Native $NssmExe @("stop", $ServiceName) | Out-Null
+    Start-Sleep -Seconds 1
     Invoke-Native $NssmExe @("remove", $ServiceName, "confirm") | Out-Null
     Start-Sleep -Seconds 2
 }
 
-$uvicornExe = Join-Path $VenvDir "Scripts\uvicorn.exe"
-$svcArgs    = "main:app --host 0.0.0.0 --port $Port"
+$UvicornExe = Join-Path $VenvDir "Scripts\uvicorn.exe"
+$SvcArgs    = "main:app --host 0.0.0.0 --port $Port"
 
-# Install service
-$r = Invoke-Native $NssmExe @("install", $ServiceName, $uvicornExe, $svcArgs)
+$r = Invoke-Native $NssmExe @("install", $ServiceName, $UvicornExe, $SvcArgs)
 if (-not $r.Success) { Die "NSSM install failed: $($r.Output)" }
 
-# Configure service (semua dengan tolerance — kalau salah satu fail, log saja)
+# Config (each call wrapped, errors warn-only)
+$nl = [Environment]::NewLine
+$EnvBlock = "SECUREOPS_AGENT_KEY=$AgentKey" + $nl + `
+            "SECUREOPS_RECORD_SESSIONS=$RecordSess" + $nl + `
+            "SECUREOPS_RECORD_DIR=$ConfigDir\sessions" + $nl + `
+            "PYTHONUNBUFFERED=1" + $nl + `
+            "PYTHONIOENCODING=utf-8"
+
+$StdoutLog = Join-Path $ConfigDir "service-stdout.log"
+$StderrLog = Join-Path $ConfigDir "service-stderr.log"
+
 $nssmConfig = @(
     @("set", $ServiceName, "AppDirectory", $BackendDir),
     @("set", $ServiceName, "DisplayName", "SecureOps Agent"),
     @("set", $ServiceName, "Description", "SecureOps Agent - Centralized security monitoring"),
-    @("set", $ServiceName, "Start", "SERVICE_AUTO_START")
-)
-
-foreach ($cfg in $nssmConfig) {
-    $r = Invoke-Native $NssmExe $cfg
-    if (-not $r.Success) {
-        Warn "NSSM config '$($cfg[2])' returned $($r.ExitCode): $($r.Output.Trim())"
-    }
-}
-
-# Environment variables for the service
-$nl = [Environment]::NewLine
-$envBlock = "SECUREOPS_AGENT_KEY=$AgentKey" + $nl +
-            "SECUREOPS_RECORD_SESSIONS=$RecordSess" + $nl +
-            "SECUREOPS_RECORD_DIR=$ConfigDir\sessions" + $nl +
-            "PYTHONUNBUFFERED=1" + $nl +
-            "PYTHONIOENCODING=utf-8"
-Invoke-Native $NssmExe @("set", $ServiceName, "AppEnvironmentExtra", $envBlock) | Out-Null
-
-# Logs
-$stdoutLog = Join-Path $ConfigDir "service-stdout.log"
-$stderrLog = Join-Path $ConfigDir "service-stderr.log"
-$logConfig = @(
-    @("set", $ServiceName, "AppStdout", $stdoutLog),
-    @("set", $ServiceName, "AppStderr", $stderrLog),
+    @("set", $ServiceName, "Start", "SERVICE_AUTO_START"),
+    @("set", $ServiceName, "AppEnvironmentExtra", $EnvBlock),
+    @("set", $ServiceName, "AppStdout", $StdoutLog),
+    @("set", $ServiceName, "AppStderr", $StderrLog),
     @("set", $ServiceName, "AppRotateFiles", "1"),
     @("set", $ServiceName, "AppRotateBytes", "10485760"),
     @("set", $ServiceName, "AppExit", "Default", "Restart"),
     @("set", $ServiceName, "AppRestartDelay", "5000")
 )
-foreach ($cfg in $logConfig) {
-    Invoke-Native $NssmExe $cfg | Out-Null
+
+foreach ($cfg in $nssmConfig) {
+    $r = Invoke-Native $NssmExe $cfg
+    if (-not $r.Success) {
+        Warn "NSSM config '$($cfg[2])' failed (non-fatal): $($r.Output.Trim())"
+    }
 }
 
 # ============================== FIREWALL ==============================
@@ -455,62 +373,59 @@ try {
         -Description "SecureOps Agent HTTP API" -ErrorAction Stop | Out-Null
     Info "Firewall rule added"
 } catch {
-    Warn "Failed to add firewall rule: $($_.Exception.Message)"
-    Warn "Manual: New-NetFirewallRule -DisplayName '$ruleName' -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow"
+    Warn "Firewall rule failed: $($_.Exception.Message) (non-fatal)"
 }
 
 # ============================== START SERVICE ==============================
 Say "Starting service..."
 try {
     Start-Service -Name $ServiceName -ErrorAction Stop
-    Start-Sleep -Seconds 3
 } catch {
-    Warn "Start-Service failed: $($_.Exception.Message)"
-    Warn "Trying NSSM start instead..."
+    Warn "Start-Service failed, trying NSSM start..."
     Invoke-Native $NssmExe @("start", $ServiceName) | Out-Null
-    Start-Sleep -Seconds 3
 }
+Start-Sleep -Seconds 3
 
-# Wait for service to become healthy
+# ============================== HEALTH CHECK ==============================
 Say "Waiting for agent to become healthy..."
 $healthy = $false
 for ($i = 1; $i -le 15; $i++) {
     try {
-        $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/api/health" -UseBasicParsing -TimeoutSec 2
-        if ($resp.StatusCode -eq 200) {
-            $healthy = $true
-            break
-        }
+        $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/api/health" `
+                                  -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+        if ($resp.StatusCode -eq 200) { $healthy = $true; break }
     } catch {}
     Start-Sleep -Seconds 1
 }
 
 if ($healthy) {
-    Info "Agent healthy after $i seconds"
+    Info "Agent healthy after ${i}s"
 } else {
-    Warn "Agent not responding yet. Check log: Get-Content $stderrLog -Tail 30"
+    Warn "Agent did not become healthy. Check logs:"
+    Warn "  Get-Content '$StderrLog' -Tail 30"
 }
 
 # ============================== AUTO-REGISTER ==============================
+$PrimaryIP = (Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp,Manual -ErrorAction SilentlyContinue |
+              Where-Object { $_.IPAddress -notmatch '^(169\.254|127\.)' } |
+              Select-Object -First 1).IPAddress
+if ([string]::IsNullOrWhiteSpace($PrimaryIP)) { $PrimaryIP = "127.0.0.1" }
+
 $AutoRegistered = $false
-$primaryIP = (Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp,Manual -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notmatch "^(169\.254|127\.)" } | Select-Object -First 1).IPAddress
-if (-not $primaryIP) {
-    $primaryIP = "127.0.0.1"
-}
-
-if ($JoinToken -and $ControllerURL) {
+if (-not [string]::IsNullOrWhiteSpace($JoinToken) -and -not [string]::IsNullOrWhiteSpace($ControllerURL)) {
     Say "Auto-registering with controller at $ControllerURL ..."
-
     $payload = @{
         token    = $JoinToken
         hostname = $env:COMPUTERNAME
-        api_url  = "http://${primaryIP}:$Port"
+        api_url  = "http://${PrimaryIP}:$Port"
         api_key  = $AgentKey
     } | ConvertTo-Json -Compress
-
     try {
-        $resp = Invoke-WebRequest -Uri "$ControllerURL/api/servers/auto-register" -Method POST -Body $payload -ContentType "application/json" -UseBasicParsing -TimeoutSec 10
-        Info "Response: $($resp.Content)"
+        $resp = Invoke-WebRequest -Uri "$ControllerURL/api/servers/auto-register" `
+                                  -Method POST -Body $payload `
+                                  -ContentType "application/json" `
+                                  -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+        Info "Auto-registration response: $($resp.Content)"
         $AutoRegistered = $true
     } catch {
         Warn "Auto-registration failed: $($_.Exception.Message)"
@@ -520,37 +435,31 @@ if ($JoinToken -and $ControllerURL) {
 # ============================== SUMMARY ==============================
 Write-Host ""
 Write-Host "=========================================================" -ForegroundColor Green
-Write-Host "  SecureOps Agent for Windows - Installed Successfully" -ForegroundColor Green
+Write-Host "  SecureOps Agent for Windows - Installed Successfully  " -ForegroundColor Green
 Write-Host "=========================================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "  OS:           $($os.Caption)" -ForegroundColor White
-Write-Host "  Hostname:     $env:COMPUTERNAME" -ForegroundColor White
-$svcStatus = (Get-Service $ServiceName).Status
-Write-Host "  Service:      $ServiceName (status: $svcStatus)" -ForegroundColor White
-Write-Host "  IP:           $primaryIP" -ForegroundColor White
-Write-Host "  Port:         $Port" -ForegroundColor White
+Write-Host "  OS:           $($os.Caption)"
+Write-Host "  Hostname:     $env:COMPUTERNAME"
+$serviceStatus = (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue).Status
+Write-Host "  Service:      $ServiceName (status: $serviceStatus)"
+Write-Host "  IP:           $PrimaryIP"
+Write-Host "  Port:         $Port"
+if ($pywinptyOK) {
+    Write-Host "  Terminal:     ENABLED" -ForegroundColor Green
+} else {
+    Write-Host "  Terminal:     DISABLED (pywinpty failed - sisanya jalan normal)" -ForegroundColor Yellow
+}
 Write-Host ""
-
 if ($AutoRegistered) {
-    Write-Host "  [SUCCESS] AUTO-REGISTERED WITH CONTROLLER" -ForegroundColor Green
-    Write-Host "     Controller: $ControllerURL" -ForegroundColor White
-    Write-Host "     No further action needed - agent is online!" -ForegroundColor Green
+    Write-Host "  AUTO-REGISTERED WITH CONTROLLER" -ForegroundColor Green
+    Write-Host "  No further action needed!" -ForegroundColor Green
 } else {
     Write-Host "  PASTE THESE TO THE CONTROLLER UI:" -ForegroundColor Yellow
-    Write-Host "  (Sidebar -> Servers -> Add Server -> Manual Entry)" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "     API URL :  http://${primaryIP}:$Port" -ForegroundColor Cyan
-    Write-Host "     API Key :  $AgentKey" -ForegroundColor Cyan
+    Write-Host "    API URL :  http://${PrimaryIP}:$Port" -ForegroundColor Cyan
+    Write-Host "    API Key :  $AgentKey" -ForegroundColor Cyan
 }
-
-Write-Host ""
-Write-Host "  Manage service:"
-Write-Host "    Get-Service $ServiceName"
-Write-Host "    Restart-Service $ServiceName"
-Write-Host "    Stop-Service $ServiceName"
 Write-Host ""
 Write-Host "  Logs:"
-Write-Host "    Get-Content $stdoutLog -Tail 30"
-Write-Host "    Get-Content $stderrLog -Tail 30"
+Write-Host "    Get-Content '$StdoutLog' -Tail 30 -Wait"
 Write-Host ""
 Write-Host "=========================================================" -ForegroundColor Green
