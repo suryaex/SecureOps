@@ -57,13 +57,9 @@ try {
 
 # ============================== AGENT KEY ==============================
 if ([string]::IsNullOrWhiteSpace($AgentKey)) {
-    Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
-    try {
-        $AgentKey = [System.Web.Security.Membership]::GeneratePassword(43, 8)
-    } catch {
-        # Fallback if System.Web not available
-        $AgentKey = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 43 | ForEach-Object { [char]$_ })
-    }
+    # CRITICAL: gunakan ONLY alphanumeric (a-z, A-Z, 0-9) supaya safe di URL
+    # query string. GeneratePassword(43,8) bisa hasilkan '#&+=' yang break URL parsing.
+    $AgentKey = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 43 | ForEach-Object { [char]$_ })
     Warn "SECUREOPS_AGENT_KEY not set - auto-generated"
 }
 

@@ -91,11 +91,13 @@ def _safe_env() -> dict:
 @router.websocket("/ws")
 async def terminal_ws(ws: WebSocket, key: str = Query(default="")):
     # ---------- Auth ----------
+    # CRITICAL: harus accept() DULU sebelum close(). Close-before-accept
+    # bikin Starlette return HTTP 403 instead of WS close code 1008.
+    await ws.accept()
     if not auth.AGENT_KEY or key != auth.AGENT_KEY:
+        log.warning(f"WS auth failed. Expected len={len(auth.AGENT_KEY)} got len={len(key)}")
         await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="bad agent key")
         return
-
-    await ws.accept()
 
     if not HAS_WINPTY:
         await ws.send_text(

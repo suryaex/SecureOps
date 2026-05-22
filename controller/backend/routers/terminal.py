@@ -14,7 +14,7 @@ Every session is recorded in admin_activity_logs (start + end with duration).
 import asyncio
 import logging
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 import httpx
 import websockets
@@ -96,7 +96,11 @@ async def terminal_proxy(ws: WebSocket, server_id: int, token: str = Query(defau
         return
 
     client_ip = ws.client.host if ws.client else "unknown"
-    upstream_url = _http_to_ws(srv.api_url.rstrip("/")) + f"/api/terminal/ws?key={srv.api_key}"
+    # CRITICAL: URL-encode the key. If agent key contains "#", "&", "+", "=" etc.
+    # (e.g. from Windows GeneratePassword), unencoded URL breaks query parsing on
+    # agent side, leading to HTTP 403. quote(safe="") encodes EVERYTHING except a-zA-Z0-9.
+    encoded_key = quote(srv.api_key, safe="")
+    upstream_url = _http_to_ws(srv.api_url.rstrip("/")) + f"/api/terminal/ws?key={encoded_key}"
 
     started = datetime.utcnow()
     _log_event(admin_username=username, admin_id=admin_id,
