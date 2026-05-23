@@ -10,7 +10,7 @@ const tabs = [
   { label: 'Alerts',        to: '/alerts' },
 ]
 
-export default function TopBar() {
+export default function TopBar({ onMenuClick }) {
   const { pathname } = useLocation()
   const navigate = useNavigate()
   const { user, logout } = useAuth()
@@ -24,6 +24,7 @@ export default function TopBar() {
   const [open, setOpen] = useState(false)
   const [alertCount, setAlertCount] = useState(0)
   const [showUserMenu, setShowUserMenu] = useState(false)
+  const [showSearch, setShowSearch] = useState(false)
 
   const wrapRef = useRef(null)
   const userRef = useRef(null)
@@ -70,14 +71,23 @@ export default function TopBar() {
   }, [])
 
   const go = (route) => {
-    setOpen(false); setSearch('')
+    setOpen(false); setSearch(''); setShowSearch(false)
     navigate(route)
   }
 
   return (
-    <header className="h-16 flex items-center gap-3 px-10 glass-strong sticky top-0 z-20 border-b border-white/40">
+    <header className="min-h-14 md:h-16 flex flex-wrap items-center gap-2 px-4 md:px-10 glass-strong sticky top-0 z-20 border-b border-white/40 py-2 md:py-0">
+      {/* Hamburger (mobile only) */}
+      <button
+        className="lg:hidden p-2 rounded-xl text-gray-500 hover:bg-gray-100 transition-colors shrink-0"
+        onClick={onMenuClick}
+        aria-label="Open menu"
+      >
+        <span className="material-symbols-outlined text-xl">menu</span>
+      </button>
+
       {/* Search */}
-      <div ref={wrapRef} className="relative flex-1 max-w-md">
+      <div ref={wrapRef} className="relative flex-1 min-w-0 max-w-md">
         <span className="material-symbols-outlined absolute left-3.5 top-1/2 -translate-y-1/2 text-ink-muted text-lg">search</span>
         <input
           type="text"
@@ -108,21 +118,21 @@ export default function TopBar() {
         )}
       </div>
 
-      <div className="flex-1" />
+      <div className="hidden md:flex flex-1" />
 
       {/* Server selector */}
       {servers && servers.length > 0 && (
-        <div ref={serverMenuRef} className="relative">
+        <div ref={serverMenuRef} className="relative hidden sm:block">
           <button
             onClick={() => setShowServerMenu(v => !v)}
             className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-gray-200 hover:border-primary hover:bg-blue-50 transition-colors text-sm"
           >
-            <span className={`w-2 h-2 rounded-full ${
+            <span className={`w-2 h-2 rounded-full shrink-0 ${
               selected?.last_status === 'online' || selected?.is_local ? 'bg-success'
               : selected?.last_status === 'offline' ? 'bg-danger' : 'bg-gray-300'
             }`} />
             <span className="material-symbols-outlined text-base text-gray-500">dns</span>
-            <span className="text-gray-800 font-medium truncate max-w-[120px]">
+            <span className="text-gray-800 font-medium truncate max-w-[100px] md:max-w-[120px]">
               {selected?.name || 'No server'}
             </span>
             <span className="material-symbols-outlined text-base text-gray-400">expand_more</span>
@@ -166,8 +176,8 @@ export default function TopBar() {
         </div>
       )}
 
-      {/* Tabs */}
-      <nav className="hidden md:flex items-center gap-1">
+      {/* Tabs — hidden on small screens */}
+      <nav className="hidden lg:flex items-center gap-1">
         {tabs.map(tab => {
           const active = pathname === tab.to
           return (
@@ -187,7 +197,7 @@ export default function TopBar() {
       </nav>
 
       {/* Icons */}
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-1 md:gap-2 shrink-0">
         <Link to="/alerts" className="relative w-9 h-9 flex items-center justify-center rounded-xl hover:bg-gray-50 text-gray-500 transition-colors" title="Alerts">
           <span className="material-symbols-outlined text-xl">notifications</span>
           {alertCount > 0 && (
@@ -196,7 +206,7 @@ export default function TopBar() {
             </span>
           )}
         </Link>
-        <Link to="/system-health" className="w-9 h-9 flex items-center justify-center rounded-xl hover:bg-gray-50 text-gray-500 transition-colors" title="System Health">
+        <Link to="/system-health" className="hidden sm:flex w-9 h-9 items-center justify-center rounded-xl hover:bg-gray-50 text-gray-500 transition-colors" title="System Health">
           <span className="material-symbols-outlined text-xl">security</span>
         </Link>
 
@@ -220,6 +230,12 @@ export default function TopBar() {
               <Link to="/support" onClick={() => setShowUserMenu(false)} className="flex items-center gap-2 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50">
                 <span className="material-symbols-outlined text-base">help_outline</span> Support
               </Link>
+              {/* Server selector shortcut on mobile */}
+              {servers && servers.length > 0 && (
+                <Link to="/servers" onClick={() => setShowUserMenu(false)} className="sm:hidden flex items-center gap-2 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50">
+                  <span className="material-symbols-outlined text-base">dns</span> Servers
+                </Link>
+              )}
               <button
                 onClick={() => { setShowUserMenu(false); logout() }}
                 className="w-full flex items-center gap-2 px-4 py-2 text-sm text-danger hover:bg-red-50 border-t border-gray-50"

@@ -101,11 +101,11 @@ class CastRecorder:
 
 @router.websocket("/ws")
 async def terminal_ws(ws: WebSocket, key: str = Query(default="")):
+    # Accept first, then validate. Close-before-accept returns HTTP 403.
+    await ws.accept()
     if not auth.AGENT_KEY or key != auth.AGENT_KEY:
         await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="bad agent key")
         return
-
-    await ws.accept()
 
     # --- Optional metadata frame sent by controller (user@ip) ---
     meta = {"user": "controller", "ip": "unknown"}

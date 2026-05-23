@@ -19,13 +19,19 @@ const bottomItems = [
   { to: '/support',  icon: 'help_outline', label: 'Support' },
 ]
 
-export default function Sidebar() {
+export default function Sidebar({ open, onClose }) {
   const { user, logout } = useAuth()
 
   return (
-    <aside className="fixed left-5 top-5 bottom-5 w-60 glass rounded-2xl flex flex-col z-30 overflow-hidden">
+    <aside className={`
+      fixed left-0 top-0 bottom-0 w-[260px]
+      lg:left-5 lg:top-5 lg:bottom-5 lg:w-60 lg:rounded-2xl
+      glass flex flex-col z-30 overflow-hidden
+      transition-transform duration-300 ease-in-out
+      ${open ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}
+    `}>
       {/* Brand */}
-      <div className="px-5 pt-6 pb-5 border-b border-white/40">
+      <div className="px-5 pt-6 pb-5 border-b border-white/40 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 bg-gradient-to-br from-primary to-primary-dark rounded-xl flex items-center justify-center shadow-[0_6px_18px_rgba(0,122,255,0.35)] shrink-0">
             <span className="material-symbols-outlined text-white text-xl filled">shield</span>
@@ -35,6 +41,14 @@ export default function Sidebar() {
             <p className="text-ink-muted text-[11px] leading-tight mt-0.5">State Polytechnic of Sriwijaya</p>
           </div>
         </div>
+        {/* Close button (mobile only) */}
+        <button
+          onClick={onClose}
+          className="lg:hidden text-ink-muted hover:text-ink p-1 rounded-lg transition-colors"
+          aria-label="Close menu"
+        >
+          <span className="material-symbols-outlined text-xl">close</span>
+        </button>
       </div>
 
       {/* Nav */}
@@ -45,6 +59,7 @@ export default function Sidebar() {
             <NavLink
               key={to}
               to={to}
+              onClick={onClose}
               className={({ isActive }) => `nav-item ${isActive ? 'nav-item-active' : 'nav-item-idle'}`}
             >
               {({ isActive }) => (
@@ -63,6 +78,7 @@ export default function Sidebar() {
           <NavLink
             key={to}
             to={to}
+            onClick={onClose}
             className={({ isActive }) => `nav-item ${isActive ? 'nav-item-active' : 'nav-item-idle'}`}
           >
             <span className="material-symbols-outlined text-xl">{icon}</span>

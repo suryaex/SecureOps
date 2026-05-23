@@ -56,18 +56,20 @@ export default function Servers() {
 
   return (
     <div className="space-y-5">
-      <div className="flex items-start justify-between">
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Monitored Servers</h1>
+          <h1 className="text-xl md:text-2xl font-bold text-gray-900">Monitored Servers</h1>
           <p className="text-gray-500 text-sm mt-0.5">Fleet of agents this controller talks to</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 shrink-0">
           <button onClick={pingAll} className="btn-secondary">
-            <span className="material-symbols-outlined text-lg">wifi_tethering</span>Ping All
+            <span className="material-symbols-outlined text-lg">wifi_tethering</span>
+            <span className="hidden sm:inline">Ping All</span>
           </button>
           {isAdmin && (
             <button onClick={() => setShowAdd(true)} className="btn-primary">
-              <span className="material-symbols-outlined text-lg">add</span>Add Server
+              <span className="material-symbols-outlined text-lg">add</span>
+              <span className="hidden sm:inline">Add Server</span>
             </button>
           )}
         </div>
@@ -192,8 +194,8 @@ function AddServerModal({ onClose, onSaved }) {
   const [mode, setMode] = useState('quick')
 
   return (
-    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl shadow-xl w-full max-w-2xl overflow-hidden max-h-[90vh] flex flex-col">
+    <div className="fixed inset-0 bg-black/40 z-50 flex items-end sm:items-center justify-center sm:p-4">
+      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-xl w-full sm:max-w-2xl overflow-hidden max-h-[92vh] flex flex-col">
         <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between shrink-0">
           <h3 className="text-gray-800 font-semibold flex items-center gap-2">
             <span className="material-symbols-outlined text-primary">add_to_queue</span>
@@ -321,9 +323,23 @@ function QuickJoinFlow({ onClose, onSaved }) {
     return () => clearInterval(t)
   }, [tokenData])
 
-  const copy = () => {
-    navigator.clipboard.writeText(tokenData.install_command)
-    setCopied(true); setTimeout(() => setCopied(false), 2000)
+  const copy = async () => {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(tokenData.install_command)
+      } else {
+        // Fallback for HTTP / non-secure contexts
+        const ta = document.createElement('textarea')
+        ta.value = tokenData.install_command
+        ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none'
+        document.body.appendChild(ta)
+        ta.focus(); ta.select()
+        document.execCommand('copy')
+        document.body.removeChild(ta)
+      }
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {}
   }
 
   const fmtTime = (s) => {
@@ -536,7 +552,7 @@ function ManualEntryForm({ onClose, onSaved }) {
         Use this when the agent is already installed on the target server. Paste its API URL & Key from the installer output (or run <code className="bg-gray-200 px-1 rounded">sudo cat /etc/secureops-agent/key</code> to retrieve later).
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <FormField label="Server name" required>
           <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="web-prod-01" required className="input" />
         </FormField>

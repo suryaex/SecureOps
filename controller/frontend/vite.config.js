@@ -7,6 +7,7 @@ export default defineConfig({
     react(),
     VitePWA({
       registerType: 'autoUpdate',
+      injectRegister: 'auto',
       includeAssets: ['favicon.svg', 'apple-touch-icon.png'],
       manifest: {
         name: 'SecureOps — Security Audit Dashboard',
@@ -15,7 +16,7 @@ export default defineConfig({
         theme_color: '#2563EB',
         background_color: '#F1F5FB',
         display: 'standalone',
-        orientation: 'portrait',
+        orientation: 'any',
         scope: '/',
         start_url: '/',
         icons: [
@@ -27,7 +28,13 @@ export default defineConfig({
       workbox: {
         navigateFallback: '/index.html',
         navigateFallbackDenylist: [/^\/api/],
+        cleanupOutdatedCaches: true,
+        skipWaiting: true,
+        clientsClaim: true,
+        // Pre-cache all build output
+        globPatterns: ['**/*.{js,css,html,svg,png,ico,woff2}'],
         runtimeCaching: [
+          // API — network-first, 5 min cache, 8s timeout
           {
             urlPattern: /^\/api\/.*$/,
             handler: 'NetworkFirst',
@@ -35,14 +42,44 @@ export default defineConfig({
               cacheName: 'secureops-api',
               networkTimeoutSeconds: 8,
               expiration: { maxEntries: 50, maxAgeSeconds: 60 * 5 },
+              cacheableResponse: { statuses: [0, 200] },
             },
           },
+          // Google Fonts stylesheet — stale-while-revalidate
           {
-            urlPattern: /^https:\/\/fonts\.(googleapis|gstatic)\.com\/.*$/,
+            urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*$/,
+            handler: 'StaleWhileRevalidate',
+            options: {
+              cacheName: 'google-fonts-stylesheets',
+              expiration: { maxEntries: 10, maxAgeSeconds: 60 * 60 * 24 * 7 },
+            },
+          },
+          // Google Fonts / Material Symbols webfont files — cache-first 1 year
+          {
+            urlPattern: /^https:\/\/fonts\.gstatic\.com\/.*$/,
             handler: 'CacheFirst',
             options: {
-              cacheName: 'google-fonts',
-              expiration: { maxEntries: 30, maxAgeSeconds: 60 * 60 * 24 * 30 },
+              cacheName: 'google-fonts-webfonts',
+              expiration: { maxEntries: 30, maxAgeSeconds: 60 * 60 * 24 * 365 },
+              cacheableResponse: { statuses: [0, 200] },
+            },
+          },
+          // JS / CSS chunks — stale-while-revalidate (instant load, background refresh)
+          {
+            urlPattern: /\.(?:js|css)$/,
+            handler: 'StaleWhileRevalidate',
+            options: {
+              cacheName: 'secureops-assets',
+              expiration: { maxEntries: 80, maxAgeSeconds: 60 * 60 * 24 * 30 },
+            },
+          },
+          // Images & icons — cache-first
+          {
+            urlPattern: /\.(?:png|jpg|jpeg|svg|gif|ico|webp)$/,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'secureops-images',
+              expiration: { maxEntries: 60, maxAgeSeconds: 60 * 60 * 24 * 30 },
             },
           },
         ],
@@ -72,7 +109,7 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks: {
-          react: ['react', 'react-dom', 'react-router-dom'],
+          react:  ['react', 'react-dom', 'react-router-dom'],
           charts: ['recharts'],
         },
       },
